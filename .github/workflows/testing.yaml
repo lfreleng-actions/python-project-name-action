@@ -18,7 +18,7 @@ permissions: {}
 jobs:
   ### Test the GitHub Action in this Repository ###
   tests:
-    name: "Test local GitHub Action"
+    name: "Action Testing"
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -27,19 +27,46 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       # Perform setup prior to running test(s)
-      - name: "Testing setup step"
-        shell: bash
-        run: |
-          # Testing setup step
-          echo "Testing setup step"
-          echo "Testing setup step/summary output" >> "$GITHUB_STEP_SUMMARY"
+      - name: "Checkout sample project repository"
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: "lfreleng-actions/test-python-project"
+          path: "test-python-project"
 
-      - name: "Running local action: ${{ github.repository }}"
+      - name: "Run Action: ${{ github.repository }}"
+        id: testing
         uses: ./
+        with:
+          path_prefix: "test-python-project/"
 
-      - name: "Validating local action: ${{ github.repository }}"
+      - name: "Validate Action Output: ${{ github.repository }}"
         shell: bash
         run: |
-          # Local action validation
-          echo "Validating local action: ${{ github.repository }}"
-          echo "Validation step summary output" >> "$GITHUB_STEP_SUMMARY"
+          # Validate Action Output
+          if [ "${{ steps.testing.outputs.python_project_file }}" \
+            != "pyproject.toml" ]; then
+            echo "Unexpected return value for: python_project_file ❌"
+            echo "Returned: ${{ steps.testing.outputs.python_project_file }}"
+            echo "Expected: pyproject.toml"
+            ERROR="true"
+          fi
+          if [ "${{ steps.testing.outputs.python_project_name }}" \
+            != "lfreleng-test-python-project" ]; then
+            echo "Unexpected return value for: python_project_name ❌"
+            echo "Returned: ${{ steps.testing.outputs.python_project_name }}"
+            echo "Expected: lfreleng-test-python-project"
+            ERROR="true"
+          fi
+          if [ "${{ steps.testing.outputs.python_package_name }}" \
+            != "lfreleng_test_python_project" ]; then
+            echo "Unexpected return value for: python_package_name ❌"
+            echo "Returned: ${{ steps.testing.outputs.python_project_name }}"
+            echo "Expected: lfreleng_test_python_project"
+            ERROR="true"
+          fi
+          if [ "$ERROR" != "true" ]; then
+            echo "All output tests passed ✅"
+          else
+            echo "At least one output test failed ❌"
+            exit 1
+          fi
