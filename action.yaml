@@ -32,7 +32,7 @@ runs:
   using: "composite"
   steps:
     # yamllint disable-line rule:line-length
-    - uses: lfit/releng-reusable-workflows/.github/actions/path-check-action@9b845102d5158f0b80bd53405a0b6855b26dc4a0 # v0.2.9
+    - uses: lfreleng-actions/path-check-action@554ef2267e6810ab7ac56506c8c1fd00725d59b1 # v0.1.0
       id: setup-py
       with:
         path: "${{ inputs.path_prefix }}setup.py"
@@ -41,14 +41,14 @@ runs:
       id: setup-name
       if: steps.setup-py.outputs.type == 'file'
       # yamllint disable-line rule:line-length
-      uses: lfit/releng-reusable-workflows/.github/actions/file-grep-regex-action@9b845102d5158f0b80bd53405a0b6855b26dc4a0 # v0.2.9
+      uses: lfreleng-actions/file-grep-regex-action@49c05f5d2d7fb736381cac77d0278af36254f462 # v0.1.0
       with:
         flags: "-oP -m1"
         regex: '(?<=name=")([^"]*)'
         path: "${{ inputs.path_prefix }}setup.py"
 
     # yamllint disable-line rule:line-length
-    - uses: lfit/releng-reusable-workflows/.github/actions/path-check-action@9b845102d5158f0b80bd53405a0b6855b26dc4a0 # v0.2.9
+    - uses: lfreleng-actions/path-check-action@554ef2267e6810ab7ac56506c8c1fd00725d59b1 # v0.1.0
       id: pyproject-toml
       with:
         path: "${{ inputs.path_prefix }}pyproject.toml"
@@ -57,7 +57,7 @@ runs:
       id: pyproject-name
       if: steps.pyproject-toml.outputs.type == 'file'
       # yamllint disable-line rule:line-length
-      uses: lfit/releng-reusable-workflows/.github/actions/file-grep-regex-action@9b845102d5158f0b80bd53405a0b6855b26dc4a0 # v0.2.9
+      uses: lfreleng-actions/file-grep-regex-action@49c05f5d2d7fb736381cac77d0278af36254f462 # v0.1.0
       with:
         flags: "-oP -m1"
         regex: '(?<=^name = ")([^"]*)'

@@ -16,8 +16,8 @@ An example workflow step using this action:
 ```yaml
 steps:
     # Code checkout performed in earlier step
-    - name: Check for Python Project
-      uses: lfit/releng-reusable-workflows/.github/actions/python-project-name-action@main
+    - name: Fetch Python project/package name
+      uses: lfreleng-actions/python-project-name-action@main
 ```
 
 ##  Inputs
