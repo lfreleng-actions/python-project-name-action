@@ -1,36 +1,32 @@
 <!--
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: 2025 The Linux Foundation
+SPDX-License-Identifier: Apache-2.0
+SPDX-FileCopyrightText: 2025 The Linux Foundation
 -->
 
-# 🛠️ Template Action
+# 🐍 Python Project/Package Names
 
-This is a template for the other actions in this Github organisation.
+Extracts the Python project name and derives the Python package name.
 
-## actions-template
+## python-project-name-action
 
 ## Usage Example
 
-<!-- markdownlint-disable MD046 -->
+An example workflow step using this action:
 
 ```yaml
 steps:
-  - name: "Action template"
-    id: action-template
-    uses: lfreleng-actions/actions-template@main
-    with:
-      input: "placeholder"
+    # Code checkout performed in earlier step
+    - name: Check for Python Project
+      uses: lfit/releng-reusable-workflows/.github/actions/python-project-name-action@main
 ```
 
-<!-- markdownlint-enable MD046 -->
-
-## Inputs
+##  Inputs
 
 <!-- markdownlint-disable MD013 -->
 
-| Variable Name | Required | Description  |
-| ------------- | -------- | ------------ |
-| INPUT         | False    | Action input |
+| Variable Name       | Required | Description                           |
+| ------------------- | -------- | ------------------------------------- |
+| PATH_PREFIX         | False    | Path/directory to Python project code |
 
 <!-- markdownlint-enable MD013 -->
 
@@ -38,12 +34,10 @@ steps:
 
 <!-- markdownlint-disable MD013 -->
 
-| Variable Name | Description   |
-| ------------- | ------------- |
-| OUTPUT        | Action output |
+| Output Variable     | Mandatory | Value                                                     |
+| ------------------- | --------- | --------------------------------------------------------- |
+| PYTHON_PACKAGE_FILE | Yes       | File used to extract metadata: pyproject.toml or setup.py |
+| PYTHON_PROJECT_NAME | Yes       | Extracted from pyproject.toml/setup.py                    |
+| PYTHON_PACKAGE_NAME | Yes       | Derived from value in pyproject.toml/setup.py             |
 
 <!-- markdownlint-enable MD013 -->
-
-## Implementation Details
-
-## Notes
