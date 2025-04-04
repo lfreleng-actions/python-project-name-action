@@ -12,7 +12,6 @@ inputs:
     description: "Directory location containing project code"
     type: string
     required: false
-    default: ""
 
 outputs:
   # Mandatory
@@ -31,11 +30,31 @@ outputs:
 runs:
   using: "composite"
   steps:
+    - name: "Setup action/environment"
+      shell: bash
+      run: |
+        # Setup action/environment
+
+        # Handle path_prefix input consistently and when absent
+        path_prefix="${{ inputs.PATH_PREFIX }}"
+        if [ -z "$path_prefix" ]; then
+          # Set current directory as path prefix
+          path_prefix="."
+        else
+          # Strip any trailing slash in provided path
+          path_prefix="${path_prefix%/}"
+        fi
+        # Verify is a valid directory path
+        if [ ! -d "$path_prefix" ]; then
+          echo "Error: invalid path/prefix to project directory ❌"; exit 1
+        fi
+        echo "path_prefix=$path_prefix" >> "$GITHUB_ENV"
+
     # yamllint disable-line rule:line-length
     - uses: lfreleng-actions/path-check-action@7f728b8ac404d3309cfa576f0ffc54217ade2faa # v0.1.1
       id: setup-py
       with:
-        path: "${{ inputs.path_prefix }}setup.py"
+        path: "${{ env.path_prefix }}/setup.py"
 
     - name: "Get project name from setup.py"
       id: setup-name
@@ -45,13 +64,13 @@ runs:
       with:
         flags: "-oP -m1"
         regex: '(?<=name=")([^"]*)'
-        path: "${{ inputs.path_prefix }}setup.py"
+        path: "${{ env.path_prefix }}/setup.py"
 
     # yamllint disable-line rule:line-length
     - uses: lfreleng-actions/path-check-action@7f728b8ac404d3309cfa576f0ffc54217ade2faa # v0.1.1
       id: pyproject-toml
       with:
-        path: "${{ inputs.path_prefix }}pyproject.toml"
+        path: "${{ env.path_prefix }}/pyproject.toml"
 
     - name: "Get project name from pyproject.toml"
       id: pyproject-name
@@ -61,7 +80,7 @@ runs:
       with:
         flags: "-oP -m1"
         regex: '(?<=^name = ")([^"]*)'
-        filename: "${{ inputs.path_prefix }}pyproject.toml"
+        filename: "${{ env.path_prefix }}/pyproject.toml"
 
     - name: "Capture Python project metadata"
       if: env.python_project != 'false'
