@@ -60,7 +60,7 @@ runs:
       id: setup-name
       if: steps.setup-py.outputs.type == 'file'
       # yamllint disable-line rule:line-length
-      uses: lfreleng-actions/file-grep-regex-action@49c05f5d2d7fb736381cac77d0278af36254f462 # v0.1.0
+      uses: lfreleng-actions/file-grep-regex-action@321870aafe79f2205c9432351b65df9f48f71177 # v0.1.1
       with:
         flags: "-oP -m1"
         regex: '(?<=name=")([^"]*)'
@@ -76,7 +76,7 @@ runs:
       id: pyproject-name
       if: steps.pyproject-toml.outputs.type == 'file'
       # yamllint disable-line rule:line-length
-      uses: lfreleng-actions/file-grep-regex-action@49c05f5d2d7fb736381cac77d0278af36254f462 # v0.1.0
+      uses: lfreleng-actions/file-grep-regex-action@321870aafe79f2205c9432351b65df9f48f71177 # v0.1.1
       with:
         flags: "-oP -m1"
         regex: '(?<=^name = ")([^"]*)'
