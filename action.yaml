@@ -8,23 +8,28 @@ description: "Extracts Python project name and derives the package name"
 
 inputs:
   # Optional
-  PATH_PREFIX:
+  path_prefix:
     description: "Directory location containing project code"
     required: false
 
 outputs:
   # Mandatory
-  PYTHON_PROJECT_FILE:
+  python_project_file:
     # Supports both pyproject.toml and setup.py
     description: "File used to extract/parse project metadata"
     value: ${{ steps.capture.outputs.python_project_file }}
-  PYTHON_PROJECT_NAME:
+  python_project_name:
     description: "Name of the Python project from pyproject.toml/setup.py"
     value: ${{ steps.capture.outputs.python_project_name }}
-  PYTHON_PACKAGE_NAME:
+  python_package_name:
     # Note: dashes in the name are substituted with underscores
     description: "The name of the Python package"
     value: ${{ steps.capture.outputs.python_package_name }}
+  source:
+    description: >-
+      Source file where project details were found
+      (pyproject.toml or setup.py)
+    value: ${{ steps.capture.outputs.source }}
 
 runs:
   using: "composite"
@@ -35,12 +40,12 @@ runs:
         # Setup action/environment
 
         # Handle path_prefix input consistently and when absent
-        path_prefix="${{ inputs.PATH_PREFIX }}"
+        path_prefix="${{ inputs.path_prefix }}"
         if [ -z "$path_prefix" ]; then
           # Set current directory as path prefix
           path_prefix="."
         else
-          # Strip any trailing slash in provided path
+          # Strip any trailing slash in provided path
           path_prefix="${path_prefix%/}"
         fi
         # Verify is a valid directory path
@@ -49,22 +54,7 @@ runs:
         fi
         echo "path_prefix=$path_prefix" >> "$GITHUB_ENV"
 
-    # yamllint disable-line rule:line-length
-    - uses: lfreleng-actions/path-check-action@9606e61c870025bc956e63156d1d55c5df54426c # v0.2.0
-      id: setup-py
-      with:
-        path: "${{ env.path_prefix }}/setup.py"
-
-    - name: "Get project name from setup.py"
-      id: setup-name
-      if: steps.setup-py.outputs.type == 'file'
-      # yamllint disable-line rule:line-length
-      uses: lfreleng-actions/file-grep-regex-action@64fbf6bd3315530c6819e16c5b065e3bfc4f16d9 # v0.1.3
-      with:
-        flags: "-oP -m1"
-        regex: '(?<=name=")([^"]*)'
-        path: "${{ env.path_prefix }}/setup.py"
-
+    # Check for pyproject.toml first (preferred)
     # yamllint disable-line rule:line-length
     - uses: lfreleng-actions/path-check-action@9606e61c870025bc956e63156d1d55c5df54426c # v0.2.0
       id: pyproject-toml
@@ -81,25 +71,49 @@ runs:
         regex: '(?<=^name = ")([^"]*)'
         filename: "${{ env.path_prefix }}/pyproject.toml"
 
+    # Fall back to setup.py if pyproject.toml doesn't exist
+    # yamllint disable-line rule:line-length
+    - uses: lfreleng-actions/path-check-action@9606e61c870025bc956e63156d1d55c5df54426c # v0.2.0
+      id: setup-py
+      if: steps.pyproject-toml.outputs.type != 'file'
+      with:
+        path: "${{ env.path_prefix }}/setup.py"
+
+    - name: "Get project name from setup.py"
+      id: setup-name
+      if: >-
+        steps.pyproject-toml.outputs.type != 'file' &&
+        steps.setup-py.outputs.type == 'file'
+      # yamllint disable-line rule:line-length
+      uses: lfreleng-actions/file-grep-regex-action@64fbf6bd3315530c6819e16c5b065e3bfc4f16d9 # v0.1.3
+      with:
+        flags: "-oP -m1"
+        regex: '(?<=name=")([^"]*)'
+        filename: "${{ env.path_prefix }}/setup.py"
+
     - name: "Capture Python project metadata"
-      if: env.python_project != 'false'
       id: capture
       shell: bash
       # yamllint disable rule:line-length
       run: |
         # Capture Python project metadata
 
-        # pyproject.toml is preferred source if both files exist
-        if [ ${{ steps.pyproject-toml.outputs.type }} = 'file' ]; then
-          PYTHON_PROJECT_NAME="${{ steps.pyproject-name.outputs.extracted_string}}"
+        # pyproject.toml is preferred source
+        if [ "${{ steps.pyproject-toml.outputs.type }}" = 'file' ]; then
+          PYTHON_PROJECT_NAME="${{ steps.pyproject-name.outputs.extracted_string }}"
           PYTHON_PROJECT_FILE="pyproject.toml"
+          SOURCE="pyproject.toml"
           echo "Using project name from: pyproject.toml ✅"
 
-        # Legacy format; does not conform to the latest PEP standards
+        # Fall back to setup.py if pyproject.toml not found
         elif [ "${{ steps.setup-py.outputs.type }}" = 'file' ]; then
-          PYTHON_PROJECT_NAME="${{ steps.setup-name.outputs.extracted_string}}"
+          PYTHON_PROJECT_NAME="${{ steps.setup-name.outputs.extracted_string }}"
           PYTHON_PROJECT_FILE="setup.py"
+          SOURCE="setup.py"
           echo "Using project name from: setup.py ⚠️"
+        else
+          echo "Error: Neither pyproject.toml nor setup.py found ❌"
+          exit 1
         fi
 
         if [ -z "$PYTHON_PROJECT_NAME" ]; then
@@ -119,3 +133,5 @@ runs:
         echo "python_package_name=$PYTHON_PACKAGE_NAME" >> "$GITHUB_OUTPUT"
         echo "python_project_file=$PYTHON_PROJECT_FILE" >> "$GITHUB_ENV"
         echo "python_project_file=$PYTHON_PROJECT_FILE" >> "$GITHUB_OUTPUT"
+        echo "source=$SOURCE" >> "$GITHUB_ENV"
+        echo "source=$SOURCE" >> "$GITHUB_OUTPUT"
