@@ -9,6 +9,23 @@ Extracts the Python project name and derives the Python package name.
 
 ## python-project-name-action
 
+The action probes the project for metadata in the following order,
+selecting the first present file (and, for `setup.cfg`, falling
+through to `setup.py` when the file is present but contains no
+`[metadata] name`):
+
+1. `pyproject.toml` — `[project] name` (PEP 621, preferred)
+2. `setup.cfg` — `[metadata] name` (legacy pbr / setuptools projects)
+3. `setup.py` — `name="…"` literal (legacy setuptools)
+
+If the chosen source is present but its name field is missing or
+empty, and no later source remains to try, the action fails rather
+than emitting an empty value.
+
+The `setup.cfg` and `setup.py` paths exist to support legacy projects
+(e.g. those still using `pbr`) that have not migrated to PEP 621
+metadata in `pyproject.toml`.
+
 ## Usage Example
 
 An example workflow step using this action:
@@ -34,10 +51,14 @@ steps:
 
 <!-- markdownlint-disable MD013 -->
 
-| Output Variable     | Mandatory | Value                                                     |
-| ------------------- | --------- | --------------------------------------------------------- |
-| PYTHON_PACKAGE_FILE | Yes       | File used to extract metadata: pyproject.toml or setup.py |
-| PYTHON_PROJECT_NAME | Yes       | Extracted from pyproject.toml/setup.py                    |
-| PYTHON_PACKAGE_NAME | Yes       | Derived from value in pyproject.toml/setup.py             |
+| Output Variable       | Mandatory | Value                                                            |
+| --------------------- | --------- | ---------------------------------------------------------------- |
+| `python_project_file` | Yes       | File used to extract metadata: pyproject.toml/setup.cfg/setup.py |
+| `python_project_name` | Yes       | Extracted from pyproject.toml, setup.cfg or setup.py             |
+| `python_package_name` | Yes       | Derived from the project name (dashes become underscores)        |
+| `source`              | Yes       | Source file used (pyproject.toml, setup.cfg or setup.py)         |
+
+The action also exports the same values as environment variables
+(lowercase names) for use in later steps within the same job.
 
 <!-- markdownlint-enable MD013 -->

@@ -132,3 +132,110 @@ jobs:
             echo "At least one output test failed for python-nss-ng ❌"
             exit 1
           fi
+
+      # Third test: synthetic setup.cfg fixture (legacy pbr/setuptools).
+      # Verifies the new setup.cfg → [metadata] name extraction path,
+      # including: case-insensitive section/key matching, `:` delimiter
+      # support, inline `;` comment stripping, and selection of source.
+      - name: "Create setup.cfg fixture"
+        shell: bash
+        run: |
+          mkdir -p test-setup-cfg
+          cat > test-setup-cfg/setup.cfg <<'EOF'
+          [Metadata]
+          Name: lfdocs-conf  ; canonical project name
+          author = LF
+
+          [options.entry_points]
+          name = wrong
+          EOF
+          cat > test-setup-cfg/setup.py <<'EOF'
+          from setuptools import setup
+          setup(setup_requires=["pbr"], pbr=True)
+          EOF
+
+      - name: "Run Action: ${{ github.repository }} [setup.cfg fixture]"
+        id: test-setup-cfg
+        uses: ./
+        with:
+          path_prefix: "test-setup-cfg/"
+
+      - name: "Validate Action Output: setup.cfg fixture"
+        shell: bash
+        env:
+          PROJECT_FILE: ${{ steps.test-setup-cfg.outputs.python_project_file }}
+          PROJECT_NAME: ${{ steps.test-setup-cfg.outputs.python_project_name }}
+          PACKAGE_NAME: ${{ steps.test-setup-cfg.outputs.python_package_name }}
+          SOURCE: ${{ steps.test-setup-cfg.outputs.source }}
+        run: |
+          # Validate setup.cfg fixture extraction
+          ERROR=""
+          if [ "$PROJECT_FILE" != "setup.cfg" ]; then
+            echo "Unexpected python_project_file: $PROJECT_FILE ❌"
+            ERROR="true"
+          fi
+          if [ "$PROJECT_NAME" != "lfdocs-conf" ]; then
+            echo "Unexpected python_project_name: $PROJECT_NAME ❌"
+            ERROR="true"
+          fi
+          if [ "$PACKAGE_NAME" != "lfdocs_conf" ]; then
+            echo "Unexpected python_package_name: $PACKAGE_NAME ❌"
+            ERROR="true"
+          fi
+          if [ "$SOURCE" != "setup.cfg" ]; then
+            echo "Unexpected source: $SOURCE ❌"
+            ERROR="true"
+          fi
+          if [ "$ERROR" != "true" ]; then
+            echo "All output tests passed for setup.cfg fixture ✅"
+          else
+            exit 1
+          fi
+
+      # Fourth test: setup.cfg present but with no [metadata] name should
+      # fall through to setup.py.
+      - name: "Create setup.cfg fall-through fixture"
+        shell: bash
+        run: |
+          mkdir -p test-setup-cfg-fallthrough
+          cat > test-setup-cfg-fallthrough/setup.cfg <<'EOF'
+          [options]
+          packages = find:
+          EOF
+          cat > test-setup-cfg-fallthrough/setup.py <<'EOF'
+          from setuptools import setup
+          setup(name="fallthrough-pkg")
+          EOF
+
+      - name: "Run Action: ${{ github.repository }} [fall-through]"
+        id: test-fallthrough
+        uses: ./
+        with:
+          path_prefix: "test-setup-cfg-fallthrough/"
+
+      - name: "Validate Action Output: fall-through"
+        shell: bash
+        env:
+          PROJECT_FILE: ${{ steps.test-fallthrough.outputs.python_project_file }}
+          PROJECT_NAME: ${{ steps.test-fallthrough.outputs.python_project_name }}
+          SOURCE: ${{ steps.test-fallthrough.outputs.source }}
+        run: |
+          # Validate setup.cfg → setup.py fall-through
+          ERROR=""
+          if [ "$PROJECT_FILE" != "setup.py" ]; then
+            echo "Unexpected python_project_file: $PROJECT_FILE ❌"
+            ERROR="true"
+          fi
+          if [ "$PROJECT_NAME" != "fallthrough-pkg" ]; then
+            echo "Unexpected python_project_name: $PROJECT_NAME ❌"
+            ERROR="true"
+          fi
+          if [ "$SOURCE" != "setup.py" ]; then
+            echo "Unexpected source: $SOURCE ❌"
+            ERROR="true"
+          fi
+          if [ "$ERROR" != "true" ]; then
+            echo "All output tests passed for fall-through fixture ✅"
+          else
+            exit 1
+          fi

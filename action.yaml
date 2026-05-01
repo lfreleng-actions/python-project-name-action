@@ -15,11 +15,12 @@ inputs:
 outputs:
   # Mandatory
   python_project_file:
-    # Supports both pyproject.toml and setup.py
+    # Supports pyproject.toml, setup.cfg and setup.py
     description: "File used to extract/parse project metadata"
     value: ${{ steps.capture.outputs.python_project_file }}
   python_project_name:
-    description: "Name of the Python project from pyproject.toml/setup.py"
+    description: >-
+      Name of the Python project from pyproject.toml/setup.cfg/setup.py
     value: ${{ steps.capture.outputs.python_project_name }}
   python_package_name:
     # Note: dashes in the name are substituted with underscores
@@ -28,7 +29,7 @@ outputs:
   source:
     description: >-
       Source file where project details were found
-      (pyproject.toml or setup.py)
+      (pyproject.toml, setup.cfg or setup.py)
     value: ${{ steps.capture.outputs.source }}
 
 runs:
@@ -71,11 +72,95 @@ runs:
         regex: '(?<=^name = ")([^"]*)'
         filename: "${{ env.path_prefix }}/pyproject.toml"
 
-    # Fall back to setup.py if pyproject.toml doesn't exist
+    # Fall back to setup.cfg ([metadata] name) for legacy pbr/setuptools
+    # yamllint disable-line rule:line-length
+    - uses: lfreleng-actions/path-check-action@9606e61c870025bc956e63156d1d55c5df54426c # v0.2.0
+      id: setup-cfg
+      if: steps.pyproject-toml.outputs.type != 'file'
+      with:
+        path: "${{ env.path_prefix }}/setup.cfg"
+
+    - name: "Get project name from setup.cfg"
+      id: setup-cfg-name
+      if: >-
+        steps.pyproject-toml.outputs.type != 'file' &&
+        steps.setup-cfg.outputs.type == 'file'
+      shell: bash
+      run: |
+        # Extract [metadata] name from setup.cfg
+        #
+        # Scope the match strictly to the [metadata] section so an
+        # unrelated `name =` (e.g. under [options.entry_points]) is
+        # not picked up. An empty / missing value is not an error
+        # here; the caller will fall through to setup.py.
+
+        cfg="${{ env.path_prefix }}/setup.cfg"
+        # Match setup.cfg parsing semantics used by configparser
+        # (setuptools/pbr): section names and option keys are
+        # case-insensitive; either `=` or `:` may delimit the
+        # key/value pair; and both `#` and `;` introduce inline
+        # comments. Normalize to lowercase before matching.
+        name=$(awk '
+          /^[[:space:]]*\[/ {
+            section=$0
+            sub(/^[[:space:]]*\[[[:space:]]*/, "", section)
+            sub(/[[:space:]]*\][[:space:]]*$/, "", section)
+            section=tolower(section)
+            next
+          }
+          {
+            line=$0
+          }
+          section == "metadata" && \
+            tolower(line) ~ /^[[:space:]]*name[[:space:]]*[=:]/ {
+            sub(/^[[:space:]]*[^=:]+[=:][[:space:]]*/, "", line)
+            sub(/[[:space:]]*([#;].*)?$/, "", line)
+            print line
+            exit
+          }
+        ' "$cfg")
+        # Defence in depth: only accept names matching a PEP 508-style
+        # project-name charset. Anything else (quotes, newlines, shell
+        # metacharacters) is treated as no match and falls through to
+        # setup.py, so a hostile setup.cfg cannot inject shell syntax
+        # into later steps that expand this output.
+        if ! printf '%s' "$name" | \
+            grep -Eq '^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$'; then
+          if [ -n "$name" ]; then
+            echo "Rejecting non-PEP-508 name from setup.cfg: $name ⚠️"
+          fi
+          name=""
+        fi
+        # Write output via the documented multiline delimiter form so
+        # that any unexpected newlines or special characters in the
+        # extracted value cannot inject additional step outputs.
+        # See:
+        # https://docs.github.com/en/actions/using-workflows/workflow-commands-for-github-actions#multiline-strings
+        # Use bash-only primitives ($RANDOM and $$) to build a
+        # delimiter unlikely to collide with content. Avoids a
+        # dependency on `uuidgen`, which may be absent in minimal
+        # runner / container images.
+        delim="EOF_${RANDOM}_${RANDOM}_$$"
+        {
+          echo "extracted_string<<$delim"
+          printf '%s\n' "$name"
+          echo "$delim"
+        } >> "$GITHUB_OUTPUT"
+        if [ -n "$name" ]; then
+          echo "Found name in setup.cfg [metadata]: $name 💬"
+        else
+          echo "No [metadata] name found in setup.cfg ⚠️"
+        fi
+
+    # Fall back to setup.py if neither pyproject.toml nor setup.cfg
+    # yielded a usable project name
     # yamllint disable-line rule:line-length
     - uses: lfreleng-actions/path-check-action@9606e61c870025bc956e63156d1d55c5df54426c # v0.2.0
       id: setup-py
-      if: steps.pyproject-toml.outputs.type != 'file'
+      if: >-
+        steps.pyproject-toml.outputs.type != 'file' &&
+        (steps.setup-cfg.outputs.type != 'file' ||
+         steps.setup-cfg-name.outputs.extracted_string == '')
       with:
         path: "${{ env.path_prefix }}/setup.py"
 
@@ -83,6 +168,8 @@ runs:
       id: setup-name
       if: >-
         steps.pyproject-toml.outputs.type != 'file' &&
+        (steps.setup-cfg.outputs.type != 'file' ||
+         steps.setup-cfg-name.outputs.extracted_string == '') &&
         steps.setup-py.outputs.type == 'file'
       # yamllint disable-line rule:line-length
       uses: lfreleng-actions/file-grep-regex-action@ba13750798b15e6acf23f3342a280ffc8148b950 # v0.1.4
@@ -94,25 +181,45 @@ runs:
     - name: "Capture Python project metadata"
       id: capture
       shell: bash
+      env:
+        # Pass step outputs in via the environment rather than
+        # interpolating them directly into the script body. This
+        # avoids any chance of repo-controlled values (notably the
+        # setup.cfg-derived name) breaking out of shell quoting in
+        # this step.
+        PYPROJECT_TOML_TYPE: ${{ steps.pyproject-toml.outputs.type }}
+        PYPROJECT_NAME: ${{ steps.pyproject-name.outputs.extracted_string }}
+        SETUP_CFG_TYPE: ${{ steps.setup-cfg.outputs.type }}
+        SETUP_CFG_NAME: ${{ steps.setup-cfg-name.outputs.extracted_string }}
+        SETUP_PY_TYPE: ${{ steps.setup-py.outputs.type }}
+        SETUP_PY_NAME: ${{ steps.setup-name.outputs.extracted_string }}
       # yamllint disable rule:line-length
       run: |
         # Capture Python project metadata
 
         # pyproject.toml is preferred source
-        if [ "${{ steps.pyproject-toml.outputs.type }}" = 'file' ]; then
-          PYTHON_PROJECT_NAME="${{ steps.pyproject-name.outputs.extracted_string }}"
+        if [ "$PYPROJECT_TOML_TYPE" = 'file' ]; then
+          PYTHON_PROJECT_NAME="$PYPROJECT_NAME"
           PYTHON_PROJECT_FILE="pyproject.toml"
           SOURCE="pyproject.toml"
           echo "Using project name from: pyproject.toml ✅"
 
-        # Fall back to setup.py if pyproject.toml not found
-        elif [ "${{ steps.setup-py.outputs.type }}" = 'file' ]; then
-          PYTHON_PROJECT_NAME="${{ steps.setup-name.outputs.extracted_string }}"
+        # Fall back to setup.cfg [metadata] (pbr / legacy setuptools)
+        elif [ "$SETUP_CFG_TYPE" = 'file' ] && \
+             [ -n "$SETUP_CFG_NAME" ]; then
+          PYTHON_PROJECT_NAME="$SETUP_CFG_NAME"
+          PYTHON_PROJECT_FILE="setup.cfg"
+          SOURCE="setup.cfg"
+          echo "Using project name from: setup.cfg ⚠️"
+
+        # Fall back to setup.py if neither of the above
+        elif [ "$SETUP_PY_TYPE" = 'file' ]; then
+          PYTHON_PROJECT_NAME="$SETUP_PY_NAME"
           PYTHON_PROJECT_FILE="setup.py"
           SOURCE="setup.py"
           echo "Using project name from: setup.py ⚠️"
         else
-          echo "Error: Neither pyproject.toml nor setup.py found ❌"
+          echo "Error: no pyproject.toml, setup.cfg or setup.py found ❌"
           exit 1
         fi
 
