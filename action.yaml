@@ -37,11 +37,16 @@ runs:
   steps:
     - name: "Setup action/environment"
       shell: bash
+      env:
+        # Pass the input via the environment rather than interpolating
+        # it directly into the script body, so a hostile value cannot
+        # break out of shell quoting (zizmor: template-injection).
+        INPUT_PATH_PREFIX: ${{ inputs.path_prefix }}
       run: |
         # Setup action/environment
 
         # Handle path_prefix input consistently and when absent
-        path_prefix="${{ inputs.path_prefix }}"
+        path_prefix="$INPUT_PATH_PREFIX"
         if [ -z "$path_prefix" ]; then
           # Set current directory as path prefix
           path_prefix="."
@@ -102,7 +107,10 @@ runs:
         # not picked up. An empty / missing value is not an error
         # here; the caller will fall through to setup.py.
 
-        cfg="${{ env.path_prefix }}/setup.cfg"
+        # path_prefix is exported via GITHUB_ENV by the setup step, so
+        # read it from the environment rather than expanding a template
+        # into this run block (zizmor: template-injection).
+        cfg="$path_prefix/setup.cfg"
         # Match setup.cfg parsing semantics used by configparser
         # (setuptools/pbr): section names and option keys are
         # case-insensitive; either `=` or `:` may delimit the

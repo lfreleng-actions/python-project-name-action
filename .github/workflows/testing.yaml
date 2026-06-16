@@ -31,6 +31,8 @@ jobs:
     steps:
       - name: "Checkout repository"
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
 
       # Perform setup prior to running test(s)
       - name: "Checkout sample project repository"
@@ -38,6 +40,7 @@ jobs:
         with:
           repository: "lfreleng-actions/test-python-project"
           path: "test-python-project"
+          persist-credentials: false
 
       - name: "Run Action: ${{ github.repository }} [test-python-project]"
         id: test-pyproject-toml
@@ -49,30 +52,35 @@ jobs:
 
       - name: "Validate Action Output: ${{ github.repository }} [test-python-project]"
         shell: bash
+        env:
+          PROJECT_FILE: ${{ steps.test-pyproject-toml.outputs.python_project_file }}
+          PROJECT_NAME: ${{ steps.test-pyproject-toml.outputs.python_project_name }}
+          PACKAGE_NAME: ${{ steps.test-pyproject-toml.outputs.python_package_name }}
+          SOURCE: ${{ steps.test-pyproject-toml.outputs.source }}
         run: |
           # Validate Action Output
-          project_file="${{ steps.test-pyproject-toml.outputs.python_project_file }}"
+          project_file="$PROJECT_FILE"
           if [ "$project_file" != "pyproject.toml" ]; then
             echo "Unexpected return value for: python_project_file ❌"
             echo "Returned: $project_file"
             echo "Expected: pyproject.toml"
             ERROR="true"
           fi
-          project_name="${{ steps.test-pyproject-toml.outputs.python_project_name }}"
+          project_name="$PROJECT_NAME"
           if [ "$project_name" != "lfreleng-test-python-project" ]; then
             echo "Unexpected return value for: python_project_name ❌"
             echo "Returned: $project_name"
             echo "Expected: lfreleng-test-python-project"
             ERROR="true"
           fi
-          package_name="${{ steps.test-pyproject-toml.outputs.python_package_name }}"
+          package_name="$PACKAGE_NAME"
           if [ "$package_name" != "lfreleng_test_python_project" ]; then
             echo "Unexpected return value for: python_package_name ❌"
             echo "Returned: $package_name"
             echo "Expected: lfreleng_test_python_project"
             ERROR="true"
           fi
-          source="${{ steps.test-pyproject-toml.outputs.source }}"
+          source="$SOURCE"
           if [ "$source" != "pyproject.toml" ]; then
             echo "Unexpected return value for: source ❌"
             echo "Returned: $source"
@@ -92,6 +100,7 @@ jobs:
         with:
           repository: "ModeSevenIndustrialSolutions/python-nss-ng"
           path: "python-nss-ng"
+          persist-credentials: false
 
       - name: "Run Action: ${{ github.repository }} [python-nss-ng]"
         id: test-python-nss-ng
@@ -101,30 +110,35 @@ jobs:
 
       - name: "Validate Action Output: ${{ github.repository }} [python-nss-ng]"
         shell: bash
+        env:
+          PROJECT_FILE: ${{ steps.test-python-nss-ng.outputs.python_project_file }}
+          PROJECT_NAME: ${{ steps.test-python-nss-ng.outputs.python_project_name }}
+          PACKAGE_NAME: ${{ steps.test-python-nss-ng.outputs.python_package_name }}
+          SOURCE: ${{ steps.test-python-nss-ng.outputs.source }}
         run: |
           # Validate Action Output
-          project_file="${{ steps.test-python-nss-ng.outputs.python_project_file }}"
+          project_file="$PROJECT_FILE"
           if [ "$project_file" != "pyproject.toml" ]; then
             echo "Unexpected return value for: python_project_file ❌"
             echo "Returned: $project_file"
             echo "Expected: pyproject.toml"
             ERROR="true"
           fi
-          project_name="${{ steps.test-python-nss-ng.outputs.python_project_name }}"
+          project_name="$PROJECT_NAME"
           if [ "$project_name" != "python-nss-ng" ]; then
             echo "Unexpected return value for: python_project_name ❌"
             echo "Returned: $project_name"
             echo "Expected: python-nss-ng"
             ERROR="true"
           fi
-          package_name="${{ steps.test-python-nss-ng.outputs.python_package_name }}"
+          package_name="$PACKAGE_NAME"
           if [ "$package_name" != "python_nss_ng" ]; then
             echo "Unexpected return value for: python_package_name ❌"
             echo "Returned: $package_name"
             echo "Expected: python_nss_ng"
             ERROR="true"
           fi
-          source="${{ steps.test-python-nss-ng.outputs.source }}"
+          source="$SOURCE"
           if [ "$source" != "pyproject.toml" ]; then
             echo "Unexpected return value for: source ❌"
             echo "Returned: $source"
