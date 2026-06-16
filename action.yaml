@@ -71,19 +71,27 @@ runs:
         flags: "-oP -m1"
         regex: '(?<=^name = ")([^"]*)'
         filename: "${{ env.path_prefix }}/pyproject.toml"
+        # A pyproject.toml may legitimately carry only a [build-system]
+        # table (PEP 517) with no [project] name, e.g. pbr / setuptools
+        # projects that keep metadata in setup.cfg. Treat "no name" as a
+        # non-fatal empty result so the setup.cfg / setup.py fallbacks can
+        # run, rather than aborting the whole action.
+        no_fail: "true"
 
-    # Fall back to setup.cfg ([metadata] name) for legacy pbr/setuptools
+    # Fall back to setup.cfg ([metadata] name) for legacy pbr/setuptools.
+    # This runs whenever pyproject.toml did not yield a project name,
+    # whether the file is absent or carries only a [build-system] table.
     # yamllint disable-line rule:line-length
     - uses: lfreleng-actions/path-check-action@9606e61c870025bc956e63156d1d55c5df54426c # v0.2.0
       id: setup-cfg
-      if: steps.pyproject-toml.outputs.type != 'file'
+      if: steps.pyproject-name.outputs.extracted_string == ''
       with:
         path: "${{ env.path_prefix }}/setup.cfg"
 
     - name: "Get project name from setup.cfg"
       id: setup-cfg-name
       if: >-
-        steps.pyproject-toml.outputs.type != 'file' &&
+        steps.pyproject-name.outputs.extracted_string == '' &&
         steps.setup-cfg.outputs.type == 'file'
       shell: bash
       run: |
@@ -158,7 +166,7 @@ runs:
     - uses: lfreleng-actions/path-check-action@9606e61c870025bc956e63156d1d55c5df54426c # v0.2.0
       id: setup-py
       if: >-
-        steps.pyproject-toml.outputs.type != 'file' &&
+        steps.pyproject-name.outputs.extracted_string == '' &&
         (steps.setup-cfg.outputs.type != 'file' ||
          steps.setup-cfg-name.outputs.extracted_string == '')
       with:
@@ -167,7 +175,7 @@ runs:
     - name: "Get project name from setup.py"
       id: setup-name
       if: >-
-        steps.pyproject-toml.outputs.type != 'file' &&
+        steps.pyproject-name.outputs.extracted_string == '' &&
         (steps.setup-cfg.outputs.type != 'file' ||
          steps.setup-cfg-name.outputs.extracted_string == '') &&
         steps.setup-py.outputs.type == 'file'
@@ -187,7 +195,6 @@ runs:
         # avoids any chance of repo-controlled values (notably the
         # setup.cfg-derived name) breaking out of shell quoting in
         # this step.
-        PYPROJECT_TOML_TYPE: ${{ steps.pyproject-toml.outputs.type }}
         PYPROJECT_NAME: ${{ steps.pyproject-name.outputs.extracted_string }}
         SETUP_CFG_TYPE: ${{ steps.setup-cfg.outputs.type }}
         SETUP_CFG_NAME: ${{ steps.setup-cfg-name.outputs.extracted_string }}
@@ -197,8 +204,10 @@ runs:
       run: |
         # Capture Python project metadata
 
-        # pyproject.toml is preferred source
-        if [ "$PYPROJECT_TOML_TYPE" = 'file' ]; then
+        # pyproject.toml is the preferred source, but only when it
+        # actually yielded a [project] name. A [build-system]-only file
+        # leaves PYPROJECT_NAME empty and must fall through to setup.cfg.
+        if [ -n "$PYPROJECT_NAME" ]; then
           PYTHON_PROJECT_NAME="$PYPROJECT_NAME"
           PYTHON_PROJECT_FILE="pyproject.toml"
           SOURCE="pyproject.toml"
@@ -219,7 +228,8 @@ runs:
           SOURCE="setup.py"
           echo "Using project name from: setup.py ⚠️"
         else
-          echo "Error: no pyproject.toml, setup.cfg or setup.py found ❌"
+          echo "Error: no project name found in pyproject.toml," \
+            "setup.cfg or setup.py ❌"
           exit 1
         fi
 

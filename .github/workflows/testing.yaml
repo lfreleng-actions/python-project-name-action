@@ -244,3 +244,66 @@ jobs:
           else
             exit 1
           fi
+
+      # Fifth test: hybrid project carrying a [build-system]-only
+      # pyproject.toml (PEP 517) alongside a setup.cfg [metadata] name.
+      # This is the pbr / setuptools-legacy layout (e.g. lfdocs-conf):
+      # pyproject.toml exists but defines no [project] name, so the
+      # action must not abort on the empty pyproject result and must
+      # resolve the name from setup.cfg.
+      - name: "Create build-system-only pyproject.toml fixture"
+        shell: bash
+        run: |
+          mkdir -p test-pyproject-build-only
+          cat > test-pyproject-build-only/pyproject.toml <<'EOF'
+          [build-system]
+          requires = ["pbr>=7.0.0"]
+          build-backend = "pbr.build"
+          EOF
+          cat > test-pyproject-build-only/setup.cfg <<'EOF'
+          [metadata]
+          name = lfdocs-conf
+          author = LF
+          EOF
+          cat > test-pyproject-build-only/setup.py <<'EOF'
+          from setuptools import setup
+          setup(pbr=True)
+          EOF
+
+      - name: "Run Action: ${{ github.repository }} [build-system-only]"
+        id: test-build-only
+        uses: ./
+        with:
+          path_prefix: "test-pyproject-build-only/"
+
+      - name: "Validate Action Output: build-system-only pyproject.toml"
+        shell: bash
+        env:
+          PROJECT_FILE: ${{ steps.test-build-only.outputs.python_project_file }}
+          PROJECT_NAME: ${{ steps.test-build-only.outputs.python_project_name }}
+          PACKAGE_NAME: ${{ steps.test-build-only.outputs.python_package_name }}
+          SOURCE: ${{ steps.test-build-only.outputs.source }}
+        run: |
+          # Validate [build-system]-only pyproject.toml falls back to setup.cfg
+          ERROR=""
+          if [ "$PROJECT_FILE" != "setup.cfg" ]; then
+            echo "Unexpected python_project_file: $PROJECT_FILE ❌"
+            ERROR="true"
+          fi
+          if [ "$PROJECT_NAME" != "lfdocs-conf" ]; then
+            echo "Unexpected python_project_name: $PROJECT_NAME ❌"
+            ERROR="true"
+          fi
+          if [ "$PACKAGE_NAME" != "lfdocs_conf" ]; then
+            echo "Unexpected python_package_name: $PACKAGE_NAME ❌"
+            ERROR="true"
+          fi
+          if [ "$SOURCE" != "setup.cfg" ]; then
+            echo "Unexpected source: $SOURCE ❌"
+            ERROR="true"
+          fi
+          if [ "$ERROR" != "true" ]; then
+            echo "All output tests passed for build-system-only fixture ✅"
+          else
+            exit 1
+          fi
