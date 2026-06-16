@@ -10,16 +10,18 @@ Extracts the Python project name and derives the Python package name.
 ## python-project-name-action
 
 The action probes the project for metadata in the following order,
-selecting the first present file (and, for `setup.cfg`, falling
-through to `setup.py` when the file is present but contains no
-`[metadata] name`):
+selecting the first source that yields a project name. The action
+skips a present source that carries no usable name and continues with
+the next one:
 
 1. `pyproject.toml` — `[project] name` (PEP 621, preferred)
 2. `setup.cfg` — `[metadata] name` (legacy pbr / setuptools projects)
 3. `setup.py` — `name="…"` literal (legacy setuptools)
 
-If the chosen source is present but its name field is missing or
-empty, and no later source remains to try, the action fails rather
+This tolerates a `pyproject.toml` that contains a `[build-system]`
+table (PEP 517) but no `[project] name` — the common pbr / setuptools
+layout — by falling through to `setup.cfg` and then `setup.py` rather
+than aborting. If no source yields a name, the action fails rather
 than emitting an empty value.
 
 The `setup.cfg` and `setup.py` paths exist to support legacy projects
