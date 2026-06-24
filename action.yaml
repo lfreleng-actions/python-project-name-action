@@ -36,6 +36,7 @@ runs:
   using: "composite"
   steps:
     - name: "Setup action/environment"
+      id: setup
       shell: bash
       env:
         # Pass the input via the environment rather than interpolating
@@ -58,14 +59,22 @@ runs:
         if [ ! -d "$path_prefix" ]; then
           echo "Error: invalid path/prefix to project directory ❌"; exit 1
         fi
-        echo "path_prefix=$path_prefix" >> "$GITHUB_ENV"
+        # Emit via the documented multiline-delimiter form so a value
+        # containing newlines cannot append additional output keys
+        # (output-injection hardening).
+        delimiter="ghadelimiter_${RANDOM}${RANDOM}${RANDOM}"
+        {
+          printf '%s<<%s\n' "path_prefix" "$delimiter"
+          printf '%s\n' "$path_prefix"
+          printf '%s\n' "$delimiter"
+        } >> "$GITHUB_OUTPUT"
 
     # Check for pyproject.toml first (preferred)
     # yamllint disable-line rule:line-length
     - uses: lfreleng-actions/path-check-action@9606e61c870025bc956e63156d1d55c5df54426c # v0.2.0
       id: pyproject-toml
       with:
-        path: "${{ env.path_prefix }}/pyproject.toml"
+        path: "${{ steps.setup.outputs.path_prefix }}/pyproject.toml"
 
     - name: "Get project name from pyproject.toml"
       id: pyproject-name
@@ -75,7 +84,7 @@ runs:
       with:
         flags: "-oP -m1"
         regex: '(?<=^name = ")([^"]*)'
-        filename: "${{ env.path_prefix }}/pyproject.toml"
+        filename: "${{ steps.setup.outputs.path_prefix }}/pyproject.toml"
         # A pyproject.toml may legitimately carry only a [build-system]
         # table (PEP 517) with no [project] name, e.g. pbr / setuptools
         # projects that keep metadata in setup.cfg. Treat "no name" as a
@@ -91,7 +100,7 @@ runs:
       id: setup-cfg
       if: steps.pyproject-name.outputs.extracted_string == ''
       with:
-        path: "${{ env.path_prefix }}/setup.cfg"
+        path: "${{ steps.setup.outputs.path_prefix }}/setup.cfg"
 
     - name: "Get project name from setup.cfg"
       id: setup-cfg-name
@@ -99,6 +108,8 @@ runs:
         steps.pyproject-name.outputs.extracted_string == '' &&
         steps.setup-cfg.outputs.type == 'file'
       shell: bash
+      env:
+        ENV_PATH_PREFIX: ${{ steps.setup.outputs.path_prefix }}
       run: |
         # Extract [metadata] name from setup.cfg
         #
@@ -107,10 +118,10 @@ runs:
         # not picked up. An empty / missing value is not an error
         # here; the caller will fall through to setup.py.
 
-        # path_prefix is exported via GITHUB_ENV by the setup step, so
-        # read it from the environment rather than expanding a template
-        # into this run block (zizmor: template-injection).
-        cfg="$path_prefix/setup.cfg"
+        # path_prefix is provided by the setup step's output, passed in
+        # via this step's env block rather than expanding a template into
+        # this run block (zizmor: template-injection).
+        cfg="$ENV_PATH_PREFIX/setup.cfg"
         # Match setup.cfg parsing semantics used by configparser
         # (setuptools/pbr): section names and option keys are
         # case-insensitive; either `=` or `:` may delimit the
@@ -178,7 +189,7 @@ runs:
         (steps.setup-cfg.outputs.type != 'file' ||
          steps.setup-cfg-name.outputs.extracted_string == '')
       with:
-        path: "${{ env.path_prefix }}/setup.py"
+        path: "${{ steps.setup.outputs.path_prefix }}/setup.py"
 
     - name: "Get project name from setup.py"
       id: setup-name
@@ -192,7 +203,7 @@ runs:
       with:
         flags: "-oP -m1"
         regex: '(?<=name=")([^"]*)'
-        filename: "${{ env.path_prefix }}/setup.py"
+        filename: "${{ steps.setup.outputs.path_prefix }}/setup.py"
 
     - name: "Capture Python project metadata"
       id: capture
@@ -251,12 +262,8 @@ runs:
         PYTHON_PACKAGE_NAME=$(echo "$PYTHON_PROJECT_NAME" | tr '-' '_')
         echo "Python package name: $PYTHON_PACKAGE_NAME"
 
-        # Make available to the GitHub environment
-        echo "python_project_name=$PYTHON_PROJECT_NAME" >> "$GITHUB_ENV"
+        # Make available as step outputs (the documented contract)
         echo "python_project_name=$PYTHON_PROJECT_NAME" >> "$GITHUB_OUTPUT"
-        echo "python_package_name=$PYTHON_PACKAGE_NAME" >> "$GITHUB_ENV"
         echo "python_package_name=$PYTHON_PACKAGE_NAME" >> "$GITHUB_OUTPUT"
-        echo "python_project_file=$PYTHON_PROJECT_FILE" >> "$GITHUB_ENV"
         echo "python_project_file=$PYTHON_PROJECT_FILE" >> "$GITHUB_OUTPUT"
-        echo "source=$SOURCE" >> "$GITHUB_ENV"
         echo "source=$SOURCE" >> "$GITHUB_OUTPUT"
