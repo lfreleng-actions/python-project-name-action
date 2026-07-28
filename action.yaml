@@ -11,6 +11,7 @@ inputs:
   path_prefix:
     description: "Directory location containing project code"
     required: false
+    default: '.'
 
 outputs:
   # Mandatory
