@@ -33,11 +33,6 @@ jobs:
       contents: read
     timeout-minutes: 2
     steps:
-      - name: "Checkout repository"
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
       # Perform setup prior to running test(s)
       - name: "Checkout sample project repository"
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -48,7 +43,7 @@ jobs:
 
       - name: "Run Action: ${{ github.repository }} [test-python-project]"
         id: test-pyproject-toml
-        uses: ./
+        uses: $/
         with:
           path_prefix: "test-python-project/"
 
@@ -108,7 +103,7 @@ jobs:
 
       - name: "Run Action: ${{ github.repository }} [python-nss-ng]"
         id: test-python-nss-ng
-        uses: ./
+        uses: $/
         with:
           path_prefix: "python-nss-ng/"
 
@@ -179,7 +174,7 @@ jobs:
 
       - name: "Run Action: ${{ github.repository }} [setup.cfg fixture]"
         id: test-setup-cfg
-        uses: ./
+        uses: $/
         with:
           path_prefix: "test-setup-cfg/"
 
@@ -232,7 +227,7 @@ jobs:
 
       - name: "Run Action: ${{ github.repository }} [fall-through]"
         id: test-fallthrough
-        uses: ./
+        uses: $/
         with:
           path_prefix: "test-setup-cfg-fallthrough/"
 
@@ -290,7 +285,7 @@ jobs:
 
       - name: "Run Action: ${{ github.repository }} [build-system-only]"
         id: test-build-only
-        uses: ./
+        uses: $/
         with:
           path_prefix: "test-pyproject-build-only/"
 
