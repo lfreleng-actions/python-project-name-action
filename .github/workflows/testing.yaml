@@ -320,3 +320,956 @@ jobs:
           else
             exit 1
           fi
+
+  ### Name extraction: quoting, spacing, scoping and parser modes ###
+  # Every fixture runs in every parser mode: tomllib on the runner's
+  # own Python, a real Python 3.10 (no tomllib, so pyproject.toml uses
+  # the awk fallback), and an image with no python3 at all (awk
+  # fallback for both pyproject.toml and setup.py).
+  name-extraction:
+    name: "Name Extraction [${{ matrix.mode.id }}]"
+    runs-on: ubuntu-24.04
+    # An empty image runs the job on the runner itself
+    container: ${{ matrix.mode.image }}
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        # One job per parser mode; each runs every fixture in turn
+        mode:
+          - id: "tomllib"
+            image: ""
+          - id: "no-tomllib"
+            image: "python:3.10-slim@sha256:9d53d8d4c0e882f61913025db53b3aec4ef74336082a9ab47d8a14e9e8329b00"
+          - id: "no-python"
+            image: "ubuntu:24.04@sha256:008173c23f95b170204355c12626cb5a965d779a7e1283b09e9cffbb1bf33ca3"
+    steps:
+      - name: "Check parser mode: ${{ matrix.mode.id }}"
+        shell: bash
+        env:
+          MODE: ${{ matrix.mode.id }}
+        run: |
+          # Fail unless the environment provides the mode under test, so
+          # an image change cannot silently skip a parser path
+          if command -v python3 > /dev/null 2>&1; then
+            python3 --version
+            if python3 -c 'import tomllib' 2> /dev/null; then
+              actual="tomllib"
+            else
+              actual="no-tomllib"
+            fi
+          else
+            actual="no-python"
+          fi
+          if [ "$actual" != "$MODE" ]; then
+            echo "Expected parser mode $MODE, found $actual ❌"
+            exit 1
+          fi
+          echo "Parser mode: $actual ✅"
+
+      # Each fixture lives in f/NN/ with its expectations alongside:
+      # expect (the name, or empty when the action must fail),
+      # file (the source it must come from) and case (its title).
+      # Fixtures listed in skip are not asserted in that mode; the
+      # import-blind awk fallback cannot resolve setup() imports.
+      # <NUL> in a fixture becomes a raw NUL byte (GNU sed).
+      - name: "Create fixtures"
+        shell: bash
+        run: |
+          # Create fixtures
+          fixture() {
+            mkdir -p "f/$1"
+            printf '%s\n' "$2" > "f/$1/case"
+            printf '%s\n' "$3" > "f/$1/file"
+            printf '%s\n' "$4" > "f/$1/expect"
+            printf '%s\n' "$5" > "f/$1/skip"
+            sed 's/<NUL>/\x00/g' > "f/$1/$3"
+          }
+          fixture 01 'pyproject single quotes' pyproject.toml 'my-project' '' <<'EOF'
+          [project]
+          name = 'my-project'
+          version = "0.1.0"
+          EOF
+          fixture 02 'pyproject no spaces' pyproject.toml 'my-project' '' <<'EOF'
+          [project]
+          name="my-project"
+          version = "0.1.0"
+          EOF
+          fixture 03 'pyproject extra spaces' pyproject.toml 'my-project' '' <<'EOF'
+          [project]
+          name  =  "my-project"
+          version = "0.1.0"
+          EOF
+          fixture 04 'pyproject uv index before project' pyproject.toml 'my-project' '' <<'EOF'
+          [[tool.uv.index]]
+          name = "pytorch"
+          url = "https://download.pytorch.org/whl/cpu"
+
+          [project]
+          name = "my-project"
+          version = "0.1.0"
+          EOF
+          fixture 05 'pyproject poetry only' pyproject.toml 'my-project' '' <<'EOF'
+          [tool.poetry]
+          name = "my-project"
+          version = "0.1.0"
+          EOF
+          fixture 06 'pyproject project wins over poetry' pyproject.toml 'my-project' '' <<'EOF'
+          [tool.poetry]
+          name = "poetry-name"
+          version = "0.1.0"
+
+          [project]
+          name = "my-project"
+          version = "0.1.0"
+          EOF
+          fixture 07 'pyproject NUL escape' pyproject.toml '' '' <<'EOF'
+          [project]
+          name = "foo\u0000bar"
+          version = "0.1.0"
+          EOF
+          fixture 08 'pyproject raw NUL' pyproject.toml '' '' <<'EOF'
+          [project]
+          name = "foo<NUL>bar"
+          version = "0.1.0"
+          EOF
+          fixture 09 'setup.py single quotes' setup.py 'my-project' '' <<'EOF'
+          from setuptools import setup
+
+          setup(name='my-project')
+          EOF
+          fixture 10 'setup.py spaces around equals' setup.py 'my-project' '' <<'EOF'
+          from setuptools import setup
+
+          setup(
+              name = "my-project",
+              version="0.1.0",
+          )
+          EOF
+          fixture 11 'setup.py package_name before name' setup.py 'my-project' '' <<'EOF'
+          from setuptools import setup
+
+          package_name="helper"
+
+          setup(
+              name="my-project",
+              packages=[package_name],
+          )
+          EOF
+          fixture 12 'setup.py aliased setup import' setup.py 'my-project' '' <<'EOF'
+          from setuptools import setup as setuptools_setup
+
+          setuptools_setup(name="my-project")
+          EOF
+          fixture 13 'setup.py module alias' setup.py 'my-project' '' <<'EOF'
+          import setuptools as st
+
+          st.setup(name="my-project")
+          EOF
+          fixture 14 'setup.py unrelated helper.setup call' setup.py 'my-project' 'no-python' <<'EOF'
+          import helper
+          import setuptools
+
+          helper.setup(name="helper")
+          setuptools.setup(name="my-project")
+          EOF
+          fixture 15 'setup.py setup from another module' setup.py 'my-project' 'no-python' <<'EOF'
+          from mylib import setup
+          from setuptools import setup as st_setup
+
+          setup(name="helper")
+          st_setup(name="my-project")
+          EOF
+          fixture 16 'setup.py packaging setup shadowed by later import' setup.py '' 'no-python' <<'EOF'
+          from setuptools import setup
+          from mylib import setup
+
+          setup(name="helper")
+          EOF
+          fixture 17 'setup.py later packaging import shadows other setup' setup.py 'my-project' 'no-python' <<'EOF'
+          from mylib import setup
+          from setuptools import setup
+
+          setup(name="my-project")
+          EOF
+          fixture 18 'setup.py NUL escape' setup.py '' '' <<'EOF'
+          from setuptools import setup
+
+          setup(name="foo\x00bar")
+          EOF
+          fixture 19 'setup.py raw NUL' setup.py '' '' <<'EOF'
+          from setuptools import setup
+
+          setup(name="foo<NUL>bar")
+          EOF
+          fixture 20 'setup.py setup() in a function before the real call' setup.py 'my-project' 'no-python' <<'EOF'
+          from setuptools import setup
+
+
+          def helper():
+              setup(name="helper")
+
+
+          setup(name="my-project")
+          EOF
+          fixture 21 'setup.py function-local import' setup.py 'my-project' 'no-python' <<'EOF'
+          from setuptools import setup
+
+
+          def unused():
+              from mylib import setup
+
+
+          setup(name="my-project")
+          EOF
+          fixture 22 'setup.py setup() only inside main()' setup.py 'my-project' '' <<'EOF'
+          from setuptools import setup
+
+
+          def main():
+              setup(name="my-project")
+
+
+          if __name__ == "__main__":
+              main()
+          EOF
+          fixture 23 'setup.py local def setup' setup.py '' 'no-python' <<'EOF'
+          def setup(**kwargs):
+              pass
+
+
+          setup(name="helper")
+          EOF
+          fixture 24 'setup.py star import from another module' setup.py '' 'no-python' <<'EOF'
+          from mylib import *
+
+          setup(name="helper")
+          EOF
+          fixture 25 'setup.py setup() with no import' setup.py '' 'no-python' <<'EOF'
+          setup(name="helper")
+          EOF
+          fixture 26 'setup.py packaging module root rebound' setup.py '' 'no-python' <<'EOF'
+          import distutils.core
+          import helper as distutils
+
+          distutils.core.setup(name="helper")
+          EOF
+          fixture 27 'setup.py import in an unrelated function' setup.py 'my-project' 'no-python' <<'EOF'
+          from setuptools import setup
+
+
+          def unused():
+              from mylib import setup
+
+
+          def main():
+              setup(name="my-project")
+
+
+          main()
+          EOF
+          fixture 28 'setup.py class body import hidden from method' setup.py '' 'no-python' <<'EOF'
+          class Builder:
+              from setuptools import setup
+
+              def run(self):
+                  setup(name="helper")
+
+
+          Builder().run()
+          EOF
+          fixture 29 'setup.py attribute assignment on the module' setup.py 'my-project' '' <<'EOF'
+          import setuptools
+
+          setuptools.version = "1"
+          setuptools.setup(name="my-project")
+          EOF
+          fixture 30 'setup.py parameter shadows setup import' setup.py '' 'no-python' <<'EOF'
+          from setuptools import setup
+
+
+          def main(setup):
+              setup(name="helper")
+
+
+          main(print)
+          EOF
+          fixture 31 'setup.py for loop rebinds setup' setup.py '' 'no-python' <<'EOF'
+          from setuptools import setup
+
+          for setup in [print]:
+              pass
+          setup(name="helper")
+          EOF
+          fixture 32 'setup.py comprehension variable does not leak' setup.py 'my-project' 'no-python' <<'EOF'
+          from setuptools import setup
+
+          names = [setup for setup in ["x"]]
+          setup(name="my-project")
+          EOF
+          fixture 33 'setup.py comprehension target shadows setup' setup.py 'my-project' 'no-python' <<'EOF'
+          from setuptools import setup
+
+          [setup(name="helper") for setup in [print]]
+          setup(name="my-project")
+          EOF
+          fixture 34 'setup.py match capture rebinds setup' setup.py '' 'no-python' <<'EOF'
+          from setuptools import setup
+
+          match print:
+              case setup:
+                  pass
+          setup(name="helper")
+          EOF
+          fixture 35 'setup.py setup() in a default value' setup.py 'my-project' 'no-python' <<'EOF'
+          from setuptools import setup
+
+
+          def configure(value=setup(name="my-project")):
+              return value
+          EOF
+          fixture 36 'setup.py default runs before def rebinds setup' setup.py 'my-project' 'no-python' <<'EOF'
+          from setuptools import setup
+
+
+          def setup(value=setup(name="my-project")):
+              return value
+          EOF
+          fixture 37 'setup.py walrus in a comprehension condition' setup.py '' 'no-python' <<'EOF'
+          from setuptools import setup
+
+          [setup(name="helper") for _ in [0] if (setup := print)]
+          EOF
+          fixture 38 'pyproject non-string project name, poetry name' pyproject.toml 'my-project' '' <<'EOF'
+          [project]
+          name = 123
+
+          [tool.poetry]
+          name = "my-project"
+          version = "0.1.0"
+          EOF
+          fixture 39 'setup.py setup() in a deferred annotation' setup.py 'my-project' 'no-python' <<'EOF'
+          from __future__ import annotations
+
+          from setuptools import setup
+
+
+          def configure(value: setup(name="fake")) -> None:
+              pass
+
+
+          setup(name="my-project")
+          EOF
+          fixture 40 'setup.py with item binds before the next item' setup.py '' 'no-python' <<'EOF'
+          from contextlib import nullcontext
+
+          from setuptools import setup
+
+          with nullcontext(lambda **_: nullcontext()) as setup, setup(name="helper"):
+              pass
+          EOF
+          fixture 41 'setup.cfg raw NUL' setup.cfg '' '' <<'EOF'
+          [metadata]
+          name = foo<NUL>bar
+          EOF
+          fixture 42 'setup.py del setup' setup.py '' 'no-python' <<'EOF'
+          from setuptools import setup
+
+          del setup
+          setup(name="helper")
+          EOF
+          fixture 43 'setup.py lambda walrus in a comprehension' setup.py 'my-project' 'no-python' <<'EOF'
+          from setuptools import setup
+
+          [(lambda: (setup := print)) for _ in [0]]
+          setup(name="my-project")
+          EOF
+          fixture 44 'setup.py call before a local assignment' setup.py '' 'no-python' <<'EOF'
+          from setuptools import setup
+
+
+          def main():
+              setup(name="helper")
+              setup = print
+
+
+          main()
+          EOF
+          fixture 45 'setup.py local annotation without a value' setup.py '' 'no-python' <<'EOF'
+          from setuptools import setup
+
+
+          def main():
+              setup: object
+              setup(name="helper")
+
+
+          main()
+          EOF
+          fixture 46 'setup.py packaging import in a dead branch' setup.py '' 'no-python' <<'EOF'
+          def setup(**kwargs):
+              pass
+
+
+          if False:
+              from setuptools import setup
+          setup(name="helper")
+          EOF
+          fixture 47 'setup.py try/except ImportError fallback' setup.py 'my-project' 'no-python' <<'EOF'
+          try:
+              from setuptools import setup
+          except ImportError:
+              from distutils.core import setup
+
+          setup(name="my-project")
+          EOF
+          fixture 48 'setup.py loop rebinds setup after the call' setup.py '' 'no-python' <<'EOF'
+          from setuptools import setup
+
+          for attempt in [1, 2]:
+              if attempt == 2:
+                  setup(name="helper")
+              setup = print
+          EOF
+          fixture 49 'setup.py dead call before the real call' setup.py 'my-project' 'no-python' <<'EOF'
+          from setuptools import setup
+
+          if False:
+              setup(name="helper")
+          setup(name="my-project")
+          EOF
+          fixture 50 'setup.py uncalled function before main' setup.py 'my-project' 'no-python' <<'EOF'
+          from setuptools import setup
+
+
+          def unused():
+              setup(name="helper")
+
+
+          def main():
+              setup(name="my-project")
+
+
+          main()
+          EOF
+          fixture 51 'setup.py conditional del before the real call' setup.py 'my-project' 'no-python' <<'EOF'
+          import os
+
+          from setuptools import setup
+
+          if os.environ.get("NEVER_SET_FOR_THIS_TEST"):
+              del setup
+          setup(name="my-project")
+          EOF
+          fixture 52 'setup.py call after return in main' setup.py 'my-project' 'no-python' <<'EOF'
+          from setuptools import setup
+
+
+          def main():
+              return
+              setup(name="wrong-name")
+
+
+          def build():
+              setup(name="my-project")
+
+
+          main()
+          build()
+          EOF
+          fixture 53 'setup.py short-circuited call' setup.py 'my-project' 'no-python' <<'EOF'
+          from setuptools import setup
+
+          False and setup(name="wrong-name")
+          setup(name="my-project")
+          EOF
+
+      # Invalid names must fail the action, so failures do not stop
+      # the job here; the final step checks every outcome and output.
+      - name: "Run Action [01: pyproject single quotes]"
+        id: f01
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/01/"
+
+      - name: "Run Action [02: pyproject no spaces]"
+        id: f02
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/02/"
+
+      - name: "Run Action [03: pyproject extra spaces]"
+        id: f03
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/03/"
+
+      - name: "Run Action [04: pyproject uv index before project]"
+        id: f04
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/04/"
+
+      - name: "Run Action [05: pyproject poetry only]"
+        id: f05
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/05/"
+
+      - name: "Run Action [06: pyproject project wins over poetry]"
+        id: f06
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/06/"
+
+      - name: "Run Action [07: pyproject NUL escape]"
+        id: f07
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/07/"
+
+      - name: "Run Action [08: pyproject raw NUL]"
+        id: f08
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/08/"
+
+      - name: "Run Action [09: setup.py single quotes]"
+        id: f09
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/09/"
+
+      - name: "Run Action [10: setup.py spaces around equals]"
+        id: f10
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/10/"
+
+      - name: "Run Action [11: setup.py package_name before name]"
+        id: f11
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/11/"
+
+      - name: "Run Action [12: setup.py aliased setup import]"
+        id: f12
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/12/"
+
+      - name: "Run Action [13: setup.py module alias]"
+        id: f13
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/13/"
+
+      - name: "Run Action [14: setup.py unrelated helper.setup call]"
+        id: f14
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/14/"
+
+      - name: "Run Action [15: setup.py setup from another module]"
+        id: f15
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/15/"
+
+      - name: "Run Action [16: setup.py packaging setup shadowed by later import]"
+        id: f16
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/16/"
+
+      - name: "Run Action [17: setup.py later packaging import shadows other setup]"
+        id: f17
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/17/"
+
+      - name: "Run Action [18: setup.py NUL escape]"
+        id: f18
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/18/"
+
+      - name: "Run Action [19: setup.py raw NUL]"
+        id: f19
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/19/"
+
+      - name: "Run Action [20: setup.py setup() in a function before the real call]"
+        id: f20
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/20/"
+
+      - name: "Run Action [21: setup.py function-local import]"
+        id: f21
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/21/"
+
+      - name: "Run Action [22: setup.py setup() only inside main()]"
+        id: f22
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/22/"
+
+      - name: "Run Action [23: setup.py local def setup]"
+        id: f23
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/23/"
+
+      - name: "Run Action [24: setup.py star import from another module]"
+        id: f24
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/24/"
+
+      - name: "Run Action [25: setup.py setup() with no import]"
+        id: f25
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/25/"
+
+      - name: "Run Action [26: setup.py packaging module root rebound]"
+        id: f26
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/26/"
+
+      - name: "Run Action [27: setup.py import in an unrelated function]"
+        id: f27
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/27/"
+
+      - name: "Run Action [28: setup.py class body import hidden from method]"
+        id: f28
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/28/"
+
+      - name: "Run Action [29: setup.py attribute assignment on the module]"
+        id: f29
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/29/"
+
+      - name: "Run Action [30: setup.py parameter shadows setup import]"
+        id: f30
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/30/"
+
+      - name: "Run Action [31: setup.py for loop rebinds setup]"
+        id: f31
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/31/"
+
+      # yamllint disable-line rule:line-length
+      - name: "Run Action [32: setup.py comprehension variable does not leak]"
+        id: f32
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/32/"
+
+      # yamllint disable-line rule:line-length
+      - name: "Run Action [33: setup.py comprehension target shadows setup]"
+        id: f33
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/33/"
+
+      - name: "Run Action [34: setup.py match capture rebinds setup]"
+        id: f34
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/34/"
+
+      - name: "Run Action [35: setup.py setup() in a default value]"
+        id: f35
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/35/"
+
+      # yamllint disable-line rule:line-length
+      - name: "Run Action [36: setup.py default runs before def rebinds setup]"
+        id: f36
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/36/"
+
+      - name: "Run Action [37: setup.py walrus in a comprehension condition]"
+        id: f37
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/37/"
+
+      # yamllint disable-line rule:line-length
+      - name: "Run Action [38: pyproject non-string project name, poetry name]"
+        id: f38
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/38/"
+
+      - name: "Run Action [39: setup.py setup() in a deferred annotation]"
+        id: f39
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/39/"
+
+      # yamllint disable-line rule:line-length
+      - name: "Run Action [40: setup.py with item binds before the next item]"
+        id: f40
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/40/"
+
+      - name: "Run Action [41: setup.cfg raw NUL]"
+        id: f41
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/41/"
+
+      - name: "Run Action [42: setup.py del setup]"
+        id: f42
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/42/"
+
+      - name: "Run Action [43: setup.py lambda walrus in a comprehension]"
+        id: f43
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/43/"
+
+      - name: "Run Action [44: setup.py call before a local assignment]"
+        id: f44
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/44/"
+
+      - name: "Run Action [45: setup.py local annotation without a value]"
+        id: f45
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/45/"
+
+      - name: "Run Action [46: setup.py packaging import in a dead branch]"
+        id: f46
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/46/"
+
+      - name: "Run Action [47: setup.py try/except ImportError fallback]"
+        id: f47
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/47/"
+
+      - name: "Run Action [48: setup.py loop rebinds setup after the call]"
+        id: f48
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/48/"
+
+      - name: "Run Action [49: setup.py dead call before the real call]"
+        id: f49
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/49/"
+
+      - name: "Run Action [50: setup.py uncalled function before main]"
+        id: f50
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/50/"
+
+      # yamllint disable-line rule:line-length
+      - name: "Run Action [51: setup.py conditional del before the real call]"
+        id: f51
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/51/"
+
+      - name: "Run Action [52: setup.py call after return in main]"
+        id: f52
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/52/"
+
+      - name: "Run Action [53: setup.py short-circuited call]"
+        id: f53
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/53/"
+
+      - name: "Validate Action Output"
+        shell: bash
+        # One line per fixture: outcome|name|package|source|project_file
+        # yamllint disable rule:line-length
+        env:
+          RESULT_01: "${{ steps.f01.outcome }}|${{ steps.f01.outputs.python_project_name }}|${{ steps.f01.outputs.python_package_name }}|${{ steps.f01.outputs.source }}|${{ steps.f01.outputs.python_project_file }}"
+          RESULT_02: "${{ steps.f02.outcome }}|${{ steps.f02.outputs.python_project_name }}|${{ steps.f02.outputs.python_package_name }}|${{ steps.f02.outputs.source }}|${{ steps.f02.outputs.python_project_file }}"
+          RESULT_03: "${{ steps.f03.outcome }}|${{ steps.f03.outputs.python_project_name }}|${{ steps.f03.outputs.python_package_name }}|${{ steps.f03.outputs.source }}|${{ steps.f03.outputs.python_project_file }}"
+          RESULT_04: "${{ steps.f04.outcome }}|${{ steps.f04.outputs.python_project_name }}|${{ steps.f04.outputs.python_package_name }}|${{ steps.f04.outputs.source }}|${{ steps.f04.outputs.python_project_file }}"
+          RESULT_05: "${{ steps.f05.outcome }}|${{ steps.f05.outputs.python_project_name }}|${{ steps.f05.outputs.python_package_name }}|${{ steps.f05.outputs.source }}|${{ steps.f05.outputs.python_project_file }}"
+          RESULT_06: "${{ steps.f06.outcome }}|${{ steps.f06.outputs.python_project_name }}|${{ steps.f06.outputs.python_package_name }}|${{ steps.f06.outputs.source }}|${{ steps.f06.outputs.python_project_file }}"
+          RESULT_07: "${{ steps.f07.outcome }}|${{ steps.f07.outputs.python_project_name }}|${{ steps.f07.outputs.python_package_name }}|${{ steps.f07.outputs.source }}|${{ steps.f07.outputs.python_project_file }}"
+          RESULT_08: "${{ steps.f08.outcome }}|${{ steps.f08.outputs.python_project_name }}|${{ steps.f08.outputs.python_package_name }}|${{ steps.f08.outputs.source }}|${{ steps.f08.outputs.python_project_file }}"
+          RESULT_09: "${{ steps.f09.outcome }}|${{ steps.f09.outputs.python_project_name }}|${{ steps.f09.outputs.python_package_name }}|${{ steps.f09.outputs.source }}|${{ steps.f09.outputs.python_project_file }}"
+          RESULT_10: "${{ steps.f10.outcome }}|${{ steps.f10.outputs.python_project_name }}|${{ steps.f10.outputs.python_package_name }}|${{ steps.f10.outputs.source }}|${{ steps.f10.outputs.python_project_file }}"
+          RESULT_11: "${{ steps.f11.outcome }}|${{ steps.f11.outputs.python_project_name }}|${{ steps.f11.outputs.python_package_name }}|${{ steps.f11.outputs.source }}|${{ steps.f11.outputs.python_project_file }}"
+          RESULT_12: "${{ steps.f12.outcome }}|${{ steps.f12.outputs.python_project_name }}|${{ steps.f12.outputs.python_package_name }}|${{ steps.f12.outputs.source }}|${{ steps.f12.outputs.python_project_file }}"
+          RESULT_13: "${{ steps.f13.outcome }}|${{ steps.f13.outputs.python_project_name }}|${{ steps.f13.outputs.python_package_name }}|${{ steps.f13.outputs.source }}|${{ steps.f13.outputs.python_project_file }}"
+          RESULT_14: "${{ steps.f14.outcome }}|${{ steps.f14.outputs.python_project_name }}|${{ steps.f14.outputs.python_package_name }}|${{ steps.f14.outputs.source }}|${{ steps.f14.outputs.python_project_file }}"
+          RESULT_15: "${{ steps.f15.outcome }}|${{ steps.f15.outputs.python_project_name }}|${{ steps.f15.outputs.python_package_name }}|${{ steps.f15.outputs.source }}|${{ steps.f15.outputs.python_project_file }}"
+          RESULT_16: "${{ steps.f16.outcome }}|${{ steps.f16.outputs.python_project_name }}|${{ steps.f16.outputs.python_package_name }}|${{ steps.f16.outputs.source }}|${{ steps.f16.outputs.python_project_file }}"
+          RESULT_17: "${{ steps.f17.outcome }}|${{ steps.f17.outputs.python_project_name }}|${{ steps.f17.outputs.python_package_name }}|${{ steps.f17.outputs.source }}|${{ steps.f17.outputs.python_project_file }}"
+          RESULT_18: "${{ steps.f18.outcome }}|${{ steps.f18.outputs.python_project_name }}|${{ steps.f18.outputs.python_package_name }}|${{ steps.f18.outputs.source }}|${{ steps.f18.outputs.python_project_file }}"
+          RESULT_19: "${{ steps.f19.outcome }}|${{ steps.f19.outputs.python_project_name }}|${{ steps.f19.outputs.python_package_name }}|${{ steps.f19.outputs.source }}|${{ steps.f19.outputs.python_project_file }}"
+          RESULT_20: "${{ steps.f20.outcome }}|${{ steps.f20.outputs.python_project_name }}|${{ steps.f20.outputs.python_package_name }}|${{ steps.f20.outputs.source }}|${{ steps.f20.outputs.python_project_file }}"
+          RESULT_21: "${{ steps.f21.outcome }}|${{ steps.f21.outputs.python_project_name }}|${{ steps.f21.outputs.python_package_name }}|${{ steps.f21.outputs.source }}|${{ steps.f21.outputs.python_project_file }}"
+          RESULT_22: "${{ steps.f22.outcome }}|${{ steps.f22.outputs.python_project_name }}|${{ steps.f22.outputs.python_package_name }}|${{ steps.f22.outputs.source }}|${{ steps.f22.outputs.python_project_file }}"
+          RESULT_23: "${{ steps.f23.outcome }}|${{ steps.f23.outputs.python_project_name }}|${{ steps.f23.outputs.python_package_name }}|${{ steps.f23.outputs.source }}|${{ steps.f23.outputs.python_project_file }}"
+          RESULT_24: "${{ steps.f24.outcome }}|${{ steps.f24.outputs.python_project_name }}|${{ steps.f24.outputs.python_package_name }}|${{ steps.f24.outputs.source }}|${{ steps.f24.outputs.python_project_file }}"
+          RESULT_25: "${{ steps.f25.outcome }}|${{ steps.f25.outputs.python_project_name }}|${{ steps.f25.outputs.python_package_name }}|${{ steps.f25.outputs.source }}|${{ steps.f25.outputs.python_project_file }}"
+          RESULT_26: "${{ steps.f26.outcome }}|${{ steps.f26.outputs.python_project_name }}|${{ steps.f26.outputs.python_package_name }}|${{ steps.f26.outputs.source }}|${{ steps.f26.outputs.python_project_file }}"
+          RESULT_27: "${{ steps.f27.outcome }}|${{ steps.f27.outputs.python_project_name }}|${{ steps.f27.outputs.python_package_name }}|${{ steps.f27.outputs.source }}|${{ steps.f27.outputs.python_project_file }}"
+          RESULT_28: "${{ steps.f28.outcome }}|${{ steps.f28.outputs.python_project_name }}|${{ steps.f28.outputs.python_package_name }}|${{ steps.f28.outputs.source }}|${{ steps.f28.outputs.python_project_file }}"
+          RESULT_29: "${{ steps.f29.outcome }}|${{ steps.f29.outputs.python_project_name }}|${{ steps.f29.outputs.python_package_name }}|${{ steps.f29.outputs.source }}|${{ steps.f29.outputs.python_project_file }}"
+          RESULT_30: "${{ steps.f30.outcome }}|${{ steps.f30.outputs.python_project_name }}|${{ steps.f30.outputs.python_package_name }}|${{ steps.f30.outputs.source }}|${{ steps.f30.outputs.python_project_file }}"
+          RESULT_31: "${{ steps.f31.outcome }}|${{ steps.f31.outputs.python_project_name }}|${{ steps.f31.outputs.python_package_name }}|${{ steps.f31.outputs.source }}|${{ steps.f31.outputs.python_project_file }}"
+          RESULT_32: "${{ steps.f32.outcome }}|${{ steps.f32.outputs.python_project_name }}|${{ steps.f32.outputs.python_package_name }}|${{ steps.f32.outputs.source }}|${{ steps.f32.outputs.python_project_file }}"
+          RESULT_33: "${{ steps.f33.outcome }}|${{ steps.f33.outputs.python_project_name }}|${{ steps.f33.outputs.python_package_name }}|${{ steps.f33.outputs.source }}|${{ steps.f33.outputs.python_project_file }}"
+          RESULT_34: "${{ steps.f34.outcome }}|${{ steps.f34.outputs.python_project_name }}|${{ steps.f34.outputs.python_package_name }}|${{ steps.f34.outputs.source }}|${{ steps.f34.outputs.python_project_file }}"
+          RESULT_35: "${{ steps.f35.outcome }}|${{ steps.f35.outputs.python_project_name }}|${{ steps.f35.outputs.python_package_name }}|${{ steps.f35.outputs.source }}|${{ steps.f35.outputs.python_project_file }}"
+          RESULT_36: "${{ steps.f36.outcome }}|${{ steps.f36.outputs.python_project_name }}|${{ steps.f36.outputs.python_package_name }}|${{ steps.f36.outputs.source }}|${{ steps.f36.outputs.python_project_file }}"
+          RESULT_37: "${{ steps.f37.outcome }}|${{ steps.f37.outputs.python_project_name }}|${{ steps.f37.outputs.python_package_name }}|${{ steps.f37.outputs.source }}|${{ steps.f37.outputs.python_project_file }}"
+          RESULT_38: "${{ steps.f38.outcome }}|${{ steps.f38.outputs.python_project_name }}|${{ steps.f38.outputs.python_package_name }}|${{ steps.f38.outputs.source }}|${{ steps.f38.outputs.python_project_file }}"
+          RESULT_39: "${{ steps.f39.outcome }}|${{ steps.f39.outputs.python_project_name }}|${{ steps.f39.outputs.python_package_name }}|${{ steps.f39.outputs.source }}|${{ steps.f39.outputs.python_project_file }}"
+          RESULT_40: "${{ steps.f40.outcome }}|${{ steps.f40.outputs.python_project_name }}|${{ steps.f40.outputs.python_package_name }}|${{ steps.f40.outputs.source }}|${{ steps.f40.outputs.python_project_file }}"
+          RESULT_41: "${{ steps.f41.outcome }}|${{ steps.f41.outputs.python_project_name }}|${{ steps.f41.outputs.python_package_name }}|${{ steps.f41.outputs.source }}|${{ steps.f41.outputs.python_project_file }}"
+          RESULT_42: "${{ steps.f42.outcome }}|${{ steps.f42.outputs.python_project_name }}|${{ steps.f42.outputs.python_package_name }}|${{ steps.f42.outputs.source }}|${{ steps.f42.outputs.python_project_file }}"
+          RESULT_43: "${{ steps.f43.outcome }}|${{ steps.f43.outputs.python_project_name }}|${{ steps.f43.outputs.python_package_name }}|${{ steps.f43.outputs.source }}|${{ steps.f43.outputs.python_project_file }}"
+          RESULT_44: "${{ steps.f44.outcome }}|${{ steps.f44.outputs.python_project_name }}|${{ steps.f44.outputs.python_package_name }}|${{ steps.f44.outputs.source }}|${{ steps.f44.outputs.python_project_file }}"
+          RESULT_45: "${{ steps.f45.outcome }}|${{ steps.f45.outputs.python_project_name }}|${{ steps.f45.outputs.python_package_name }}|${{ steps.f45.outputs.source }}|${{ steps.f45.outputs.python_project_file }}"
+          RESULT_46: "${{ steps.f46.outcome }}|${{ steps.f46.outputs.python_project_name }}|${{ steps.f46.outputs.python_package_name }}|${{ steps.f46.outputs.source }}|${{ steps.f46.outputs.python_project_file }}"
+          RESULT_47: "${{ steps.f47.outcome }}|${{ steps.f47.outputs.python_project_name }}|${{ steps.f47.outputs.python_package_name }}|${{ steps.f47.outputs.source }}|${{ steps.f47.outputs.python_project_file }}"
+          RESULT_48: "${{ steps.f48.outcome }}|${{ steps.f48.outputs.python_project_name }}|${{ steps.f48.outputs.python_package_name }}|${{ steps.f48.outputs.source }}|${{ steps.f48.outputs.python_project_file }}"
+          RESULT_49: "${{ steps.f49.outcome }}|${{ steps.f49.outputs.python_project_name }}|${{ steps.f49.outputs.python_package_name }}|${{ steps.f49.outputs.source }}|${{ steps.f49.outputs.python_project_file }}"
+          RESULT_50: "${{ steps.f50.outcome }}|${{ steps.f50.outputs.python_project_name }}|${{ steps.f50.outputs.python_package_name }}|${{ steps.f50.outputs.source }}|${{ steps.f50.outputs.python_project_file }}"
+          RESULT_51: "${{ steps.f51.outcome }}|${{ steps.f51.outputs.python_project_name }}|${{ steps.f51.outputs.python_package_name }}|${{ steps.f51.outputs.source }}|${{ steps.f51.outputs.python_project_file }}"
+          RESULT_52: "${{ steps.f52.outcome }}|${{ steps.f52.outputs.python_project_name }}|${{ steps.f52.outputs.python_package_name }}|${{ steps.f52.outputs.source }}|${{ steps.f52.outputs.python_project_file }}"
+          RESULT_53: "${{ steps.f53.outcome }}|${{ steps.f53.outputs.python_project_name }}|${{ steps.f53.outputs.python_package_name }}|${{ steps.f53.outputs.source }}|${{ steps.f53.outputs.python_project_file }}"
+          MODE: ${{ matrix.mode.id }}
+        # yamllint enable rule:line-length
+        run: |
+          # Validate every fixture, reporting all failures before exiting
+          failures=0
+          for dir in f/*/; do
+            nn=$(basename "$dir")
+            case_name=$(cat "$dir/case")
+            expect=$(cat "$dir/expect")
+            source=$(cat "$dir/file")
+            if [[ " $(cat "$dir/skip") " == *" $MODE "* ]]; then
+              echo "⏭️  $nn $case_name: not asserted in $MODE mode"
+              continue
+            fi
+            var="RESULT_$nn"
+            if [ -z "${!var+set}" ]; then
+              echo "❌ $nn $case_name: no result recorded"
+              failures=$((failures + 1))
+              continue
+            fi
+            IFS="|" read -r outcome name package got_source got_file \
+              <<< "${!var}"
+            errors=()
+            if [ -z "$expect" ]; then
+              # The action must fail rather than emit a name the shell
+              # altered (e.g. "foo<NUL>bar" becoming "foobar")
+              [ "$outcome" = "failure" ] ||
+                errors+=("expected failure, outcome: $outcome")
+              [ -z "$name" ] || errors+=("unexpected name: $name")
+            else
+              [ "$outcome" = "success" ] || errors+=("outcome: $outcome")
+              [ "$name" = "$expect" ] || errors+=("python_project_name: $name")
+              [ "$package" = "${expect//-/_}" ] ||
+                errors+=("python_package_name: $package")
+              [ "$got_source" = "$source" ] || errors+=("source: $got_source")
+              [ "$got_file" = "$source" ] ||
+                errors+=("python_project_file: $got_file")
+            fi
+            if [ "${#errors[@]}" -eq 0 ]; then
+              echo "✅ $nn $case_name"
+            else
+              echo "❌ $nn $case_name: ${errors[*]}"
+              failures=$((failures + 1))
+            fi
+          done
+          if [ "$failures" -ne 0 ]; then
+            echo "$failures fixture(s) failed ❌"
+            exit 1
+          fi
+          echo "All fixtures passed ✅"

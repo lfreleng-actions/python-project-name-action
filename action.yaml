@@ -80,18 +80,133 @@ runs:
     - name: "Get project name from pyproject.toml"
       id: pyproject-name
       if: steps.pyproject-toml.outputs.type == 'file'
-      # yamllint disable-line rule:line-length
-      uses: lfreleng-actions/file-grep-regex-action@59207af3cc409b4da571dbe6bad3617c0e225173 # v0.1.6
-      with:
-        flags: "-oP -m1"
-        regex: '(?<=^name = ")([^"]*)'
-        filename: "${{ steps.setup.outputs.path_prefix }}/pyproject.toml"
+      shell: bash
+      env:
+        ENV_PATH_PREFIX: ${{ steps.setup.outputs.path_prefix }}
+      run: |
+        # Extract the project name from pyproject.toml
+        #
         # A pyproject.toml may legitimately carry only a [build-system]
         # table (PEP 517) with no [project] name, e.g. pbr / setuptools
-        # projects that keep metadata in setup.cfg. Treat "no name" as a
-        # non-fatal empty result so the setup.cfg / setup.py fallbacks can
-        # run, rather than aborting the whole action.
-        no_fail: "true"
+        # projects that keep metadata in setup.cfg. An empty result is
+        # not an error here; the caller falls through to setup.cfg and
+        # setup.py.
+
+        toml="$ENV_PATH_PREFIX/pyproject.toml"
+        # Parse the file with tomllib (Python 3.11+) so that every valid
+        # TOML spelling of the name is read. Only [project] name (PEP
+        # 621) and, failing that, [tool.poetry] name (Poetry 1.x) count;
+        # a `name` key in any other table (e.g. [[tool.uv.index]]) is
+        # ignored.
+        #
+        # Only names matching a PEP 508-style project-name charset are
+        # accepted, as in the setup.cfg step, so a hostile pyproject.toml
+        # cannot inject shell syntax into later steps. The parser checks
+        # the whole string before printing it: command substitution
+        # drops NUL bytes, so a check made only after capture would
+        # accept "foo\u0000bar" as "foobar".
+        pep508='^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$'
+        parsed="false"
+        if command -v python3 > /dev/null 2>&1 && \
+          name=$(python3 - "$toml" "$pep508" <<'PY'
+        import re
+        import sys
+
+        try:
+            import tomllib
+        except ImportError:
+            sys.exit(3)
+        try:
+            with open(sys.argv[1], "rb") as toml_file:
+                data = tomllib.load(toml_file)
+        except (OSError, tomllib.TOMLDecodeError) as exc:
+            print(f"Unable to parse pyproject.toml: {exc}", file=sys.stderr)
+            sys.exit(4)
+
+
+        def lookup(table, *keys):
+            for key in keys:
+                table = table.get(key) if isinstance(table, dict) else None
+            return table if isinstance(table, str) else ""
+
+
+        name = lookup(data, "project", "name")
+        name = name or lookup(data, "tool", "poetry", "name")
+        if name and not re.fullmatch(sys.argv[2], name):
+            print(
+                f"Rejecting non-PEP-508 name from pyproject.toml: {name!r}",
+                file=sys.stderr,
+            )
+            name = ""
+        print(name)
+        PY
+          ); then
+          parsed="true"
+        fi
+        # Without Python 3.11+, or when tomllib rejects the file, fall
+        # back to a line-based match scoped to the same two tables that
+        # accepts either quote style and any whitespace around `=`.
+        # TOML forbids raw NUL bytes, and some awk implementations pass
+        # them through for command substitution to drop, so skip the
+        # fallback for any file that holds one.
+        if [ "$parsed" != "true" ] && \
+          [ "$(tr -d '\000' < "$toml" | wc -c)" -ne "$(wc -c < "$toml")" ]; then
+          echo "Ignoring pyproject.toml: it contains NUL bytes ⚠️"
+          name=""
+        elif [ "$parsed" != "true" ]; then
+          echo "Parsing pyproject.toml without tomllib ⚠️"
+          name=$(awk -v sq="'" -v dq='"' '
+            /^[[:space:]]*\[/ {
+              table=$0
+              sub(/#.*$/, "", table)
+              gsub(/[[:space:]]/, "", table)
+              next
+            }
+            (table == "[project]" || table == "[tool.poetry]") &&
+            /^[[:space:]]*name[[:space:]]*=/ {
+              value=$0
+              sub(/^[[:space:]]*name[[:space:]]*=[[:space:]]*/, "", value)
+              quote=substr(value, 1, 1)
+              end=0
+              if (quote == sq || quote == dq) {
+                value=substr(value, 2)
+                end=index(value, quote)
+              }
+              value=(end > 1) ? substr(value, 1, end - 1) : ""
+              # As with tomllib, only a non-empty string counts; otherwise
+              # [tool.poetry] name may still supply the project name
+              if (table == "[project]" && value != "") {
+                project=value
+                found=1
+                exit
+              }
+              if (table == "[tool.poetry]" && poetry == "") poetry=value
+            }
+            END { print (found ? project : poetry) }
+          ' "$toml")
+        fi
+        # Check again here, for the fallback's result. Match the whole
+        # string: an embedded newline would pass a line-based grep.
+        if [[ ! "$name" =~ $pep508 ]]; then
+          if [ -n "$name" ]; then
+            # %q keeps an embedded newline from starting a log line that
+            # the runner would parse as a workflow command.
+            printf 'Rejecting non-PEP-508 name from pyproject.toml: %q ⚠️\n' \
+              "$name"
+          fi
+          name=""
+        fi
+        delim="EOF_${RANDOM}_${RANDOM}_$$"
+        {
+          echo "extracted_string<<$delim"
+          printf '%s\n' "$name"
+          echo "$delim"
+        } >> "$GITHUB_OUTPUT"
+        if [ -n "$name" ]; then
+          echo "Found name in pyproject.toml: $name 💬"
+        else
+          echo "No project name found in pyproject.toml ⚠️"
+        fi
 
     # Fall back to setup.cfg ([metadata] name) for legacy pbr/setuptools.
     # This runs whenever pyproject.toml did not yield a project name,
@@ -128,34 +243,46 @@ runs:
         # case-insensitive; either `=` or `:` may delimit the
         # key/value pair; and both `#` and `;` introduce inline
         # comments. Normalize to lowercase before matching.
-        name=$(awk '
-          /^[[:space:]]*\[/ {
-            section=$0
-            sub(/^[[:space:]]*\[[[:space:]]*/, "", section)
-            sub(/[[:space:]]*\][[:space:]]*$/, "", section)
-            section=tolower(section)
-            next
-          }
-          {
-            line=$0
-          }
-          section == "metadata" && \
-            tolower(line) ~ /^[[:space:]]*name[[:space:]]*[=:]/ {
-            sub(/^[[:space:]]*[^=:]+[=:][[:space:]]*/, "", line)
-            sub(/[[:space:]]*([#;].*)?$/, "", line)
-            print line
-            exit
-          }
-        ' "$cfg")
+        #
+        # configparser rejects raw NUL bytes, and some awk
+        # implementations pass them through for command substitution to
+        # drop (turning foo<NUL>bar into foobar), so skip the file.
+        if [ "$(tr -d '\000' < "$cfg" | wc -c)" -ne "$(wc -c < "$cfg")" ]; then
+          echo "Ignoring setup.cfg: it contains NUL bytes ⚠️"
+          name=""
+        else
+          name=$(awk '
+            /^[[:space:]]*\[/ {
+              section=$0
+              sub(/^[[:space:]]*\[[[:space:]]*/, "", section)
+              sub(/[[:space:]]*\][[:space:]]*$/, "", section)
+              section=tolower(section)
+              next
+            }
+            {
+              line=$0
+            }
+            section == "metadata" && \
+              tolower(line) ~ /^[[:space:]]*name[[:space:]]*[=:]/ {
+              sub(/^[[:space:]]*[^=:]+[=:][[:space:]]*/, "", line)
+              sub(/[[:space:]]*([#;].*)?$/, "", line)
+              print line
+              exit
+            }
+          ' "$cfg")
+        fi
         # Defence in depth: only accept names matching a PEP 508-style
         # project-name charset. Anything else (quotes, newlines, shell
         # metacharacters) is treated as no match and falls through to
         # setup.py, so a hostile setup.cfg cannot inject shell syntax
-        # into later steps that expand this output.
-        if ! printf '%s' "$name" | \
-            grep -Eq '^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$'; then
+        # into later steps that expand this output. Match the whole
+        # string, as for pyproject.toml and setup.py.
+        pep508='^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$'
+        if [[ ! "$name" =~ $pep508 ]]; then
           if [ -n "$name" ]; then
-            echo "Rejecting non-PEP-508 name from setup.cfg: $name ⚠️"
+            # %q keeps the value on one line in the log
+            printf 'Rejecting non-PEP-508 name from setup.cfg: %q ⚠️\n' \
+              "$name"
           fi
           name=""
         fi
@@ -199,12 +326,925 @@ runs:
         (steps.setup-cfg.outputs.type != 'file' ||
          steps.setup-cfg-name.outputs.extracted_string == '') &&
         steps.setup-py.outputs.type == 'file'
-      # yamllint disable-line rule:line-length
-      uses: lfreleng-actions/file-grep-regex-action@59207af3cc409b4da571dbe6bad3617c0e225173 # v0.1.6
-      with:
-        flags: "-oP -m1"
-        regex: '(?<=name=")([^"]*)'
-        filename: "${{ steps.setup.outputs.path_prefix }}/setup.py"
+      shell: bash
+      env:
+        ENV_PATH_PREFIX: ${{ steps.setup.outputs.path_prefix }}
+      run: |
+        # Extract the name passed to setup() in setup.py
+
+        setup_py="$ENV_PATH_PREFIX/setup.py"
+        # Read the `name` keyword of the setup() call from the syntax
+        # tree, which accepts any quoting and spacing and ignores
+        # identifiers such as `package_name`. A non-literal value
+        # (e.g. name=NAME) yields no name rather than a wrong one. As in
+        # the pyproject.toml step, the parser applies the PEP 508-style
+        # check before printing, since command substitution drops NUL
+        # bytes and would turn "foo\x00bar" into "foobar".
+        pep508='^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$'
+        parsed="false"
+        if command -v python3 > /dev/null 2>&1 && \
+          name=$(python3 - "$setup_py" "$pep508" <<'PY'
+        import ast
+        import re
+        import sys
+
+        if sys.version_info < (3, 8):
+            sys.exit(3)
+        try:
+            with open(sys.argv[1], "rb") as setup_file:
+                tree = ast.parse(setup_file.read(), sys.argv[1])
+        except (OSError, SyntaxError, ValueError) as exc:
+            print(f"Unable to parse setup.py: {exc}", file=sys.stderr)
+            sys.exit(4)
+        # Accept setup() only from a packaging module, however it is
+        # imported, so helper.setup(...) or a setup imported from another
+        # module cannot supply the name. Imports and definitions apply in
+        # source order and each call is judged against the bindings in
+        # force at that point, so a later import of setup from elsewhere
+        # shadows a packaging one. A bare setup() counts only when bound
+        # to a packaging setup, by an import or a star import from a
+        # packaging module; a local def or assignment of setup does not.
+        PACKAGING = {
+            "setuptools",
+            "distutils.core",
+            "numpy.distutils.core",
+            "skbuild",
+        }
+
+
+        def dotted(node):
+            if isinstance(node, ast.Name):
+                return node.id
+            if isinstance(node, ast.Attribute):
+                base = dotted(node.value)
+                return f"{base}.{node.attr}" if base else ""
+            return ""
+
+
+        # A name's binding is the set of kinds it may refer to, across
+        # the control flow paths that reach a point; UNBOUND marks a path
+        # on which it was never bound
+        UNBOUND = "unbound"
+
+
+        def bind(bindings, name, kind):
+            # Bind a name to one kind. Rebinding a name also cuts off
+            # anything recorded beneath it: once distutils is rebound,
+            # distutils.core no longer reaches the packaging module
+            for key in [k for k in bindings if k.startswith(f"{name}.")]:
+                bindings[key] = frozenset({"other"})
+            bindings[name] = frozenset({kind})
+
+
+        def kinds(bindings, name):
+            # What a name may refer to, ignoring paths on which it is
+            # unbound: calling an unbound name fails rather than run setup
+            return bindings.get(name, frozenset()) - {UNBOUND}
+
+
+        def bind_import(node, bindings):
+            # Record what each local name refers to: "setup" for a
+            # packaging setup(), "module" for a packaging module, "other"
+            # for anything else. A later import replaces an earlier one.
+            if isinstance(node, ast.ImportFrom):
+                module = node.module if node.level == 0 else None
+                for alias in node.names:
+                    if alias.name == "*":
+                        # A star import binds setup when the module has it
+                        packaging = module in PACKAGING
+                        kind = "setup" if packaging else "other"
+                        bind(bindings, "setup", kind)
+                        continue
+                    local = alias.asname or alias.name
+                    if f"{module}.{alias.name}" in PACKAGING:
+                        bind(bindings, local, "module")
+                    elif module in PACKAGING and alias.name == "setup":
+                        bind(bindings, local, "setup")
+                    else:
+                        bind(bindings, local, "other")
+                return
+            for alias in node.names:
+                if alias.asname:
+                    packaging = alias.name in PACKAGING
+                    kind = "module" if packaging else "other"
+                    bind(bindings, alias.asname, kind)
+                    continue
+                # `import a.b.c` binds a, reaching a.b and a.b.c too; the
+                # paths beneath a are recorded after a is rebound. If a
+                # already names an imported module, it is the same module
+                # object, so paths recorded beneath it stay reachable.
+                parts = alias.name.split(".")
+                if bindings.get(parts[0]) != frozenset({"imported"}):
+                    bind(bindings, parts[0], "imported")
+                for end in range(1, len(parts) + 1):
+                    if ".".join(parts[:end]) in PACKAGING:
+                        bindings[".".join(parts[:end])] = frozenset({"module"})
+
+
+        def target_names(target):
+            # The names an assignment target binds: a plain name, and the
+            # names inside tuple/list unpacking and *starred parts. The
+            # base of x.attr = ... or x[i] = ... is not rebound.
+            if isinstance(target, ast.Name):
+                yield target.id
+            elif isinstance(target, ast.Starred):
+                yield from target_names(target.value)
+            elif isinstance(target, (ast.Tuple, ast.List)):
+                for element in target.elts:
+                    yield from target_names(element)
+
+
+        def bound_names(node):
+            # The names a definition or binding statement rebinds
+            if isinstance(node, BINDS_BY_NAME):
+                return [node.name]
+            if isinstance(node, ast.ExceptHandler):
+                return [node.name] if node.name else []
+            if isinstance(node, MATCH_CAPTURES):
+                # case x, case [*x], case {**x} and case ... as x
+                captured = getattr(node, "name", None)
+                captured = captured or getattr(node, "rest", None)
+                return [captured] if captured else []
+            if isinstance(node, ast.Assign):
+                targets = node.targets
+            elif isinstance(node, ast.Delete):
+                # del x unbinds x; del x.attr and del x[i] leave x bound
+                targets = node.targets
+            elif isinstance(node, ast.AnnAssign) and node.value is None:
+                # x: T declares x without binding it
+                targets = []
+            else:
+                # AnnAssign, AugAssign, For, AsyncFor and NamedExpr
+                targets = [node.target]
+            return [
+                name
+                for target in targets
+                if target is not None
+                for name in target_names(target)
+            ]
+
+
+        def bind_definition(node, bindings):
+            # A definition or binding statement rebinds its names to
+            # something local, which is never a packaging setup; del
+            # leaves a name unbound, so a later call on that path fails
+            # rather than reach anything
+            kind = UNBOUND if isinstance(node, ast.Delete) else "other"
+            for name in bound_names(node):
+                bind(bindings, name, kind)
+
+
+        def is_setup(func, bindings):
+            # A packaging setup() on every path that binds the name
+            if isinstance(func, ast.Name):
+                return kinds(bindings, func.id) == {"setup"}
+            if isinstance(func, ast.Attribute) and func.attr == "setup":
+                return kinds(bindings, dotted(func.value)) == {"module"}
+            return False
+
+
+        # The imports, calls and definitions belonging to one scope, in
+        # any order. Nested function and class bodies are not entered: a
+        # def or class still binds its name here, but its body is a scope
+        # of its own that may never run, and a lambda neither binds nor
+        # runs here. Statements in if/try/with/for/while blocks belong
+        # to the scope that contains them, so those are included.
+        SKIPPED_SCOPES = (
+            ast.FunctionDef,
+            ast.AsyncFunctionDef,
+            ast.ClassDef,
+            ast.Lambda,
+        )
+
+
+        def parameter_nodes(spec):
+            # Every parameter of a def or lambda signature
+            params = [*spec.posonlyargs, *spec.args, *spec.kwonlyargs]
+            return params + [p for p in (spec.vararg, spec.kwarg) if p]
+
+
+        def header_expressions(node):
+            # The parts of a def, class or lambda that run in the enclosing
+            # scope when it is defined: decorators, default values, and a
+            # class's bases and keywords. Annotations are left out: they
+            # are deferred under from __future__ import annotations and
+            # evaluated lazily from Python 3.14 (PEP 649), so a call in one
+            # is not reliably made.
+            found = list(getattr(node, "decorator_list", []))
+            if isinstance(node, ast.ClassDef):
+                found += node.bases
+                found += [keyword.value for keyword in node.keywords]
+                return found
+            spec = node.args
+            found += spec.defaults
+            found += [value for value in spec.kw_defaults if value is not None]
+            return found
+
+
+        def own_nodes(node, whole=None):
+            # A node and everything beneath it in the same scope. A def or
+            # class binds its name and runs its header here, but its body
+            # is a scope of its own; a lambda runs only its defaults here.
+            # A comprehension is a scope of its own too, scanned as a unit
+            # where it appears (see scan_comprehension). Scanning also keeps
+            # each node type in whole as a unit, to handle itself.
+            whole = whole or COMPREHENSIONS
+            if isinstance(node, SKIPPED_SCOPES):
+                if not isinstance(node, ast.Lambda):
+                    yield node
+                for expression in header_expressions(node):
+                    yield from own_nodes(expression, whole)
+                return
+            yield node
+            if not isinstance(node, whole):
+                yield from scope_nodes(node, whole)
+
+
+        def scope_nodes(node, whole=None):
+            children = ast.iter_child_nodes(node)
+            if isinstance(node, ast.AnnAssign):
+                # x: T = v evaluates v, but T is not reliably evaluated:
+                # never for a local variable (PEP 526), and deferred or
+                # lazy at module and class level, as for def annotations
+                children = [node.target] + ([node.value] if node.value else [])
+            for child in children:
+                yield from own_nodes(child, whole)
+
+
+        def expression_nodes(expression):
+            # An expression and the nodes within it, for one scope, keeping
+            # comprehensions and short-circuit and conditional expressions
+            # whole, to be scanned as units
+            return list(own_nodes(expression, SCANNED_UNITS))
+
+
+        def body_nodes(scope):
+            # The nodes of a def or class body, which is a scope of its
+            # own; its header ran in the enclosing scope
+            for statement in scope.body:
+                yield from own_nodes(statement)
+
+
+        BINDS_BY_NAME = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+        COMPREHENSIONS = (
+            ast.ListComp,
+            ast.SetComp,
+            ast.DictComp,
+            ast.GeneratorExp,
+        )
+        # Pattern captures in a match statement (Python 3.10+ only)
+        MATCH_CAPTURES = tuple(
+            getattr(ast, kind)
+            for kind in ("MatchAs", "MatchStar", "MatchMapping")
+            if hasattr(ast, kind)
+        )
+        # Statements and expressions that bind names in their own scope;
+        # a comprehension's loop variables are bound in its own scope
+        NAME_BINDERS = (
+            *BINDS_BY_NAME,
+            ast.Assign,
+            ast.AnnAssign,
+            ast.AugAssign,
+            ast.Delete,
+            ast.For,
+            ast.AsyncFor,
+            ast.ExceptHandler,
+            ast.NamedExpr,
+            *MATCH_CAPTURES,
+        )
+        IMPORTS = (ast.Import, ast.ImportFrom)
+        # Expressions whose later parts may not run: and/or stop early,
+        # and a conditional expression runs one of its two branches
+        SHORT_CIRCUITS = (ast.BoolOp, ast.IfExp)
+        # Expression nodes scanning keeps whole, to handle as units
+        SCANNED_UNITS = (*COMPREHENSIONS, *SHORT_CIRCUITS)
+        SCANNED = (*IMPORTS, ast.Call, *SCANNED_UNITS, *NAME_BINDERS)
+        # Statements after which nothing else in their block runs
+        TERMINATORS = (ast.Return, ast.Raise, ast.Break, ast.Continue)
+
+
+        def binds_by_name(node):
+            return isinstance(node, BINDS_BY_NAME)
+
+
+        def literal_name(call):
+            for keyword in call.keywords:
+                value = keyword.value
+                if (
+                    keyword.arg == "name"
+                    and isinstance(value, ast.Constant)
+                    and isinstance(value.value, str)
+                ):
+                    return value.value
+            return ""
+
+
+        def event_position(node):
+            # When a node takes effect in straight-line code, in Python's
+            # evaluation order. A call runs once its arguments are
+            # evaluated, and an assignment, def or class binds after its
+            # value or header, so both take effect where they end; a call
+            # ending at the same place as a binding runs first
+            # (setup = setup(...)).
+            runs = isinstance(node, (ast.Call, *SCANNED_UNITS))
+            return (node.end_lineno, node.end_col_offset, 0 if runs else 1)
+
+
+        def scan_events(nodes, bindings):
+            # Apply the calls and bindings of straight-line code (one simple
+            # statement, or one expression) in evaluation order, updating
+            # bindings in place. Return (found a packaging setup() call,
+            # its literal name).
+            ordered = sorted(
+                (node for node in nodes if isinstance(node, SCANNED)),
+                key=event_position,
+            )
+            found = False
+            for node in ordered:
+                if isinstance(node, IMPORTS):
+                    bind_import(node, bindings)
+                    continue
+                if isinstance(node, COMPREHENSIONS):
+                    hit, name = scan_comprehension(node, bindings)
+                    found = found or hit
+                    if name:
+                        return True, name
+                    continue
+                if isinstance(node, SHORT_CIRCUITS):
+                    hit, name = scan_short_circuit(node, bindings)
+                    found = found or hit
+                    if name:
+                        return True, name
+                    continue
+                if isinstance(node, NAME_BINDERS):
+                    bind_definition(node, bindings)
+                    continue
+                if SETTLING or not is_setup(node.func, bindings):
+                    continue
+                found = True
+                name = literal_name(node)
+                if name and CONDITIONAL:
+                    CANDIDATES[-1].append(name)
+                    continue
+                if name:
+                    return True, name
+            return found, ""
+
+
+        def scan_short_circuit(node, bindings):
+            # The first operand of and/or, or the test of a conditional
+            # expression, always runs. Each later operand runs only if the
+            # ones before it did not settle the result, and a conditional
+            # expression runs one branch, so calls there are candidates and
+            # their bindings (from :=) merge as ones that may not happen.
+            # Updates bindings in place; returns (found, literal name).
+            if isinstance(node, ast.IfExp):
+                first, rest = node.test, [node.body, node.orelse]
+                chained = False
+            else:
+                first, rest, chained = node.values[0], node.values[1:], True
+            found, name = scan_events(expression_nodes(first), bindings)
+            if name:
+                return True, name
+            ends = [] if not chained else [dict(bindings)]
+            current = dict(bindings)
+            with Conditional():
+                for part in rest:
+                    # An and/or operand runs after the ones before it; a
+                    # conditional expression's branches are alternatives
+                    state = current if chained else dict(bindings)
+                    hit, _ = scan_events(expression_nodes(part), state)
+                    found = found or hit
+                    ends.append(dict(state))
+            merged = merge(*ends)
+            bindings.clear()
+            bindings.update(merged)
+            return found, ""
+
+
+        def merge(*states):
+            # The bindings where control flow paths meet: a name may refer
+            # to anything it did on any path, or be unbound on a path that
+            # never bound it
+            unbound = frozenset({UNBOUND})
+            names = {name for state in states for name in state}
+            merged = {}
+            for name in names:
+                options = [state.get(name, unbound) for state in states]
+                merged[name] = frozenset().union(*options)
+            return merged
+
+
+        def ast_types(*names):
+            # The named AST node types this Python version has
+            return tuple(getattr(ast, n) for n in names if hasattr(ast, n))
+
+
+        # Compound statements that only some Python versions have
+        TRY_STATEMENTS = ast_types("Try", "TryStar")
+        MATCH_STATEMENTS = ast_types("Match")
+        # Enough passes for a loop's bindings to settle: each pass can only
+        # add kinds to a name, and there are few kinds
+        LOOP_LIMIT = 8
+        # Non-empty while a loop's bindings settle, when calls are not yet
+        # judged
+        SETTLING = []
+        # Non-empty while scanning a path that may not run (an if branch,
+        # an except handler, a match case, a loop or comprehension body).
+        # A packaging call found there is only a candidate: a call that
+        # certainly runs is preferred, so a dead branch cannot supply the
+        # name ahead of the real call.
+        CONDITIONAL = []
+        # One list per scope being scanned, holding its candidates in
+        # evaluation order
+        CANDIDATES = []
+
+
+        class Conditional:
+            # Mark the code scanned inside it as a path that may not run
+            def __enter__(self):
+                CONDITIONAL.append(True)
+
+            def __exit__(self, *exc):
+                CONDITIONAL.pop()
+
+
+        def run_block(statements, bindings):
+            # Run a block of statements from the given bindings, following
+            # control flow, and stop after return, raise, break or continue:
+            # nothing after one of those in the block runs. Return (found a
+            # packaging setup() call, its literal name, the bindings after
+            # the block).
+            found = False
+            for statement in statements:
+                hit, name, bindings = run_statement(statement, bindings)
+                found = found or hit
+                if name:
+                    return True, name, bindings
+                if isinstance(statement, TERMINATORS):
+                    break
+            return found, "", bindings
+
+
+        def run_loop(body, bindings, target):
+            # A loop body may run any number of times, so a call in it
+            # counts only if it holds on every pass. First settle the
+            # bindings at the body's start (no passes, or any number)
+            # without judging calls, then run the body once from there.
+            # The state after the loop is that settled state.
+            def one_pass(entry):
+                state = dict(entry)
+                for name in target_names(target) if target else []:
+                    bind(state, name, "other")
+                return run_block(body, state)
+
+            entry = bindings
+            if SETTLING:
+                # Inside an outer loop that is still settling: one pass
+                # here is enough, since the outer loop repeats this one,
+                # and it keeps nested loops from multiplying passes
+                return False, "", merge(entry, one_pass(entry)[2])
+            SETTLING.append(True)
+            try:
+                for _ in range(LOOP_LIMIT):
+                    widened = merge(entry, one_pass(entry)[2])
+                    if widened == entry:
+                        break
+                    entry = widened
+            finally:
+                SETTLING.pop()
+            # The body may run no times at all
+            with Conditional():
+                found, name, _ = one_pass(entry)
+            return found, name, entry
+
+
+        def run_try(node, state):
+            # The body may raise at any point, so a handler starts from
+            # what held before or after it; else runs after the body, and
+            # finally after every path
+            found, name, after_body = run_block(node.body, state)
+            if name:
+                return True, name, after_body
+            raised = merge(state, after_body)
+            hit, name, after_else = run_block(node.orelse, after_body)
+            found = found or hit
+            if name:
+                return True, name, after_else
+            ends = [after_else]
+            for handler in node.handlers:
+                handler_state = dict(raised)
+                # A handler runs only if the body raises
+                with Conditional():
+                    hit, name, handler_end = run_handler(handler, handler_state)
+                found = found or hit
+                if name:
+                    return True, name, handler_end
+                ends.append(handler_end)
+            hit, name, after = run_block(node.finalbody, merge(*ends))
+            return found or hit, name, after
+
+
+        def run_handler(handler, state):
+            # Run one except clause: its type, then its body with any
+            # `as` name bound, which Python unbinds again at its end
+            found = False
+            if handler.type is not None:
+                hit, name = scan_events(expression_nodes(handler.type), state)
+                found = found or hit
+                if name:
+                    return True, name, state
+            if handler.name:
+                bind(state, handler.name, "other")
+            hit, name, end = run_block(handler.body, state)
+            if handler.name:
+                end = dict(end)
+                end[handler.name] = frozenset({UNBOUND})
+            return found or hit, name, end
+
+
+        def run_match(node, state):
+            # Each case starts from the state before the match, binding its
+            # pattern's captures; when no case matches, nothing is bound
+            found, name = scan_events(expression_nodes(node.subject), state)
+            if name:
+                return True, name, state
+            ends = [state]
+            for case in node.cases:
+                # A case runs only if its pattern matches
+                with Conditional():
+                    hit, name, case_end = run_case(case, dict(state))
+                found = found or hit
+                if name:
+                    return True, name, case_end
+                ends.append(case_end)
+            return found, "", merge(*ends)
+
+
+        def run_case(case, state):
+            # Run one match case: its pattern's captures and guard, then
+            # its body
+            found = False
+            parts = [case.pattern] + ([case.guard] if case.guard else [])
+            for part in parts:
+                hit, name = scan_events(expression_nodes(part), state)
+                found = found or hit
+                if name:
+                    return True, name, state
+            hit, name, end = run_block(case.body, state)
+            return found or hit, name, end
+
+
+        def run_branches(test, branches, state):
+            # Evaluate a test, then run each alternative branch from the
+            # resulting state and merge where they meet
+            found, name = scan_events(expression_nodes(test), state)
+            if name:
+                return True, name, state
+            ends = []
+            for branch in branches:
+                # Each branch runs only if the test selects it
+                with Conditional():
+                    hit, name, end = run_block(branch, state)
+                found = found or hit
+                if name:
+                    return True, name, end
+                ends.append(end)
+            return found, "", merge(*ends)
+
+
+        def run_loop_statement(node, state):
+            # Evaluate a loop's iterable or test, run the body any number
+            # of times, then its else clause
+            is_for = not isinstance(node, ast.While)
+            head = node.iter if is_for else node.test
+            found, name = scan_events(expression_nodes(head), state)
+            if name:
+                return True, name, state
+            target = node.target if is_for else None
+            hit, name, after = run_loop(node.body, state, target)
+            if name:
+                return True, name, after
+            more, name, after = run_block(node.orelse, after)
+            return found or hit or more, name, after
+
+
+        def run_with(node, state):
+            # Each item binds its target before the next item runs; the
+            # body always runs
+            found = False
+            for item in node.items:
+                context = expression_nodes(item.context_expr)
+                hit, name = scan_events(context, state)
+                found = found or hit
+                if name:
+                    return True, name, state
+                for target in target_names(item.optional_vars):
+                    bind(state, target, "other")
+            hit, name, state = run_block(node.body, state)
+            return found or hit, name, state
+
+
+        def run_if(node, state):
+            return run_branches(node.test, [node.body, node.orelse], state)
+
+
+        def compound_runner(node):
+            # The handler for a compound statement, or None for a simple
+            # statement run as straight-line code
+            runners = (
+                (ast.If, run_if),
+                ((ast.For, ast.AsyncFor, ast.While), run_loop_statement),
+                ((ast.With, ast.AsyncWith), run_with),
+                (TRY_STATEMENTS, run_try),
+                (MATCH_STATEMENTS, run_match),
+            )
+            for kinds_of_node, runner in runners:
+                if kinds_of_node and isinstance(node, kinds_of_node):
+                    return runner
+            return None
+
+
+        def run_statement(node, bindings):
+            # Run one statement. Branches start from the same state and
+            # merge where they meet, so a binding on a path that may not run
+            # (an if, a loop body, an except handler, a match case) makes a
+            # name ambiguous rather than replacing it. Return (found a
+            # packaging setup() call, its literal name, the bindings after).
+            state = dict(bindings)
+            runner = compound_runner(node)
+            if runner:
+                return runner(node, state)
+            found, name = scan_events(own_nodes(node, SCANNED_UNITS), state)
+            return found, name, state
+
+
+        def scan_comprehension(node, enclosing):
+            # The first iterable runs in the enclosing scope. Each target
+            # then binds in the comprehension's own scope, before its
+            # conditions, any later iterables and the element run, in that
+            # order and sharing one set of bindings, so an assignment
+            # expression in a condition is seen by the element. Such an
+            # assignment also binds in the enclosing scope (PEP 572); the
+            # language forbids one in a comprehension's iterable.
+            inner = dict(enclosing)
+            parts = []
+            for index, generator in enumerate(node.generators):
+                parts.append((generator.iter, index == 0))
+                parts.append((generator.target, None))
+                parts.extend((condition, False) for condition in generator.ifs)
+            if isinstance(node, ast.DictComp):
+                parts += [(node.key, False), (node.value, False)]
+            else:
+                parts.append((node.elt, False))
+            found = False
+            for index, (part, runs_outside) in enumerate(parts):
+                if runs_outside is None:
+                    for name in target_names(part):
+                        bind(inner, name, "other")
+                    continue
+                scope = dict(enclosing) if runs_outside else inner
+                # Everything after the first iterable runs once per item,
+                # which may be no times at all
+                if index == 0:
+                    hit, name = scan_events(expression_nodes(part), scope)
+                else:
+                    with Conditional():
+                        hit, name = scan_events(expression_nodes(part), scope)
+                found = found or hit
+                if name:
+                    return True, name
+            for walrus in comprehension_walruses(node):
+                bind_definition(walrus, enclosing)
+            return found, ""
+
+
+        def find_setup(statements, bindings):
+            # Run one scope's statements, starting from the bindings it
+            # inherits. Return (found a packaging setup() call, its
+            # literal name, whether that call certainly runs, the scope's
+            # bindings at the end). A call that certainly runs wins; one
+            # on a path that may not run is used only when there is none.
+            CANDIDATES.append([])
+            saved = list(CONDITIONAL)
+            CONDITIONAL.clear()
+            try:
+                found, name, end = run_block(statements, dict(bindings))
+                candidates = CANDIDATES[-1]
+            finally:
+                CANDIDATES.pop()
+                CONDITIONAL[:] = saved
+            if name:
+                return True, name, True, end
+            if candidates:
+                return True, candidates[0], False, end
+            return found, "", False, end
+
+
+        def parameters(function):
+            # Every parameter name of a def, which is local to its body
+            return [param.arg for param in parameter_nodes(function.args)]
+
+
+        def comprehension_walruses(node):
+            # The assignment expressions a comprehension makes in its own
+            # scope, including in nested comprehensions, all of which bind
+            # in the enclosing scope (PEP 572). A lambda body is a scope of
+            # its own, so only its defaults are searched.
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, ast.Lambda):
+                    for default in header_expressions(child):
+                        if isinstance(default, ast.NamedExpr):
+                            yield default
+                        yield from comprehension_walruses(default)
+                    continue
+                if isinstance(child, ast.NamedExpr):
+                    yield child
+                yield from comprehension_walruses(child)
+
+
+        def imported_names(node):
+            # The local names an import statement binds
+            names = []
+            for alias in node.names:
+                if alias.asname:
+                    names.append(alias.asname)
+                elif isinstance(node, ast.Import):
+                    names.append(alias.name.split(".")[0])
+                elif alias.name != "*":
+                    names.append(alias.name)
+            return names
+
+
+        def function_locals(function):
+            # Python decides a function's local names before it runs: any
+            # name bound anywhere in its body is local throughout, so using
+            # one before it is bound fails (UnboundLocalError) rather than
+            # reaching an outer setup. Names declared global or nonlocal
+            # are not local.
+            local, declared = set(), set()
+            for node in body_nodes(function):
+                if isinstance(node, (ast.Global, ast.Nonlocal)):
+                    declared.update(node.names)
+                elif isinstance(node, (ast.With, ast.AsyncWith)):
+                    for item in node.items:
+                        if item.optional_vars is not None:
+                            local.update(target_names(item.optional_vars))
+                elif isinstance(node, IMPORTS):
+                    local.update(imported_names(node))
+                elif isinstance(node, COMPREHENSIONS):
+                    for walrus in comprehension_walruses(node):
+                        local.update(bound_names(walrus))
+                elif isinstance(node, ast.AnnAssign):
+                    # x: T makes x local even with no value, like any
+                    # binding; (x): T and x.attr: T do not
+                    if node.simple and isinstance(node.target, ast.Name):
+                        local.add(node.target.id)
+                elif isinstance(node, NAME_BINDERS):
+                    local.update(bound_names(node))
+            return local - declared
+
+
+        def search_scopes(scope, inherited, called, results):
+            # Scan each function and class defined in this scope, then the
+            # ones nested in them, in source order, adding what each finds
+            # to results. Each starts from what it inherits, so a name bound
+            # in one function never leaks into another. A function sees its
+            # enclosing scope's bindings, with every name it binds anywhere,
+            # parameters included, local from the start; a class body's own
+            # names are not visible inside its methods.
+            nested = filter(binds_by_name, scope_nodes(scope))
+            for child in sorted(nested, key=lambda n: (n.lineno, n.col_offset)):
+                start = dict(inherited)
+                if not isinstance(child, ast.ClassDef):
+                    for name in function_locals(child):
+                        bind(start, name, UNBOUND)
+                    for param in parameters(child):
+                        bind(start, param, "other")
+                found, name, certain, bindings = find_setup(child.body, start)
+                # A class body runs when it is defined; a function only if
+                # something calls it
+                runs = isinstance(child, ast.ClassDef) or child.name in called
+                if found:
+                    results.append((runs, certain, name))
+                if isinstance(child, ast.ClassDef):
+                    bindings = inherited
+                search_scopes(child, bindings, called, results)
+
+
+        def best_result(results):
+            # Prefer a call the file certainly reaches: a function it calls
+            # over one it never does, and a call that certainly runs within
+            # its body over one on a path that may not
+            for rank in ((1, 1), (1, 0), (0, 1), (0, 0)):
+                for runs, certain, name in results:
+                    if name and (runs, certain) == rank:
+                        return True, name
+            return bool(results), ""
+
+
+        def called_names(tree):
+            # Every name the file calls, directly or as an attribute
+            names = set()
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call):
+                    func = node.func
+                    if isinstance(func, ast.Name):
+                        names.add(func.id)
+                    elif isinstance(func, ast.Attribute):
+                        names.add(func.attr)
+            return names
+
+
+        def calls_setup(nodes):
+            # Whether a bare setup() is called here, packaging or not; a
+            # call such as helper.setup() says nothing about where the
+            # project's setup() lives
+            return any(
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "setup"
+                for node in nodes
+            )
+
+
+        # Prefer a setup() call made at module level. Only when module
+        # level calls no bare setup() (e.g. setup() inside a main() the
+        # file calls) look in function and class bodies too, each with
+        # its own bindings on top of the module's final ones; a
+        # module-level setup() that is not a packaging one stays rejected.
+        found_call, name, _, module_bindings = find_setup(tree.body, {})
+        if not found_call and not calls_setup(scope_nodes(tree)):
+            results = []
+            search_scopes(tree, module_bindings, called_names(tree), results)
+            found_call, name = best_result(results)
+        # Without a recognised setup() call, report it rather than guess
+        # from another call's name= argument.
+        if not found_call:
+            print("No packaging setup() call in setup.py", file=sys.stderr)
+        elif not name:
+            print("setup() in setup.py has no literal name", file=sys.stderr)
+        if name and not re.fullmatch(sys.argv[2], name):
+            print(
+                f"Rejecting non-PEP-508 name from setup.py: {name!r}",
+                file=sys.stderr,
+            )
+            name = ""
+        print(name)
+        PY
+          ); then
+          parsed="true"
+        fi
+        # Without a usable Python, or when setup.py does not parse
+        # (e.g. Python 2 syntax), fall back to the first quoted
+        # `name=` whose `name` is not the tail of a longer identifier.
+        # Python rejects raw NUL bytes in source, and some awk
+        # implementations pass them through for command substitution
+        # to drop, so skip the fallback for any file that holds one.
+        if [ "$parsed" != "true" ] && \
+          [ "$(tr -d '\000' < "$setup_py" | wc -c)" -ne \
+            "$(wc -c < "$setup_py")" ]; then
+          echo "Ignoring setup.py: it contains NUL bytes ⚠️"
+          name=""
+        elif [ "$parsed" != "true" ]; then
+          echo "Parsing setup.py without the Python ast module ⚠️"
+          name=$(awk -v sq="'" -v dq='"' '
+            /^[[:space:]]*#/ { next }
+            {
+              line=" " $0
+              pattern="[^A-Za-z0-9_]name[[:space:]]*=[[:space:]]*"
+              while (match(line, pattern)) {
+                line=substr(line, RSTART + RLENGTH)
+                quote=substr(line, 1, 1)
+                if (quote != sq && quote != dq) continue
+                value=substr(line, 2)
+                end=index(value, quote)
+                if (end > 1) {
+                  print substr(value, 1, end - 1)
+                  exit
+                }
+              }
+            }
+          ' "$setup_py")
+        fi
+        # Check again here, for the fallback's result.
+        if [[ ! "$name" =~ $pep508 ]]; then
+          if [ -n "$name" ]; then
+            printf 'Rejecting non-PEP-508 name from setup.py: %q ⚠️\n' "$name"
+          fi
+          name=""
+        fi
+        delim="EOF_${RANDOM}_${RANDOM}_$$"
+        {
+          echo "extracted_string<<$delim"
+          printf '%s\n' "$name"
+          echo "$delim"
+        } >> "$GITHUB_OUTPUT"
+        if [ -n "$name" ]; then
+          echo "Found name in setup.py: $name 💬"
+        else
+          echo "No project name found in setup.py ⚠️"
+        fi
 
     - name: "Capture Python project metadata"
       id: capture

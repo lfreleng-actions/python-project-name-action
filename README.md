@@ -14,9 +14,29 @@ selecting the first source that yields a project name. The action
 skips a present source that carries no usable name and continues with
 the next one:
 
-1. `pyproject.toml` — `[project] name` (PEP 621, preferred)
+1. `pyproject.toml` — `[project] name` (PEP 621, preferred), or
+   `[tool.poetry] name` when the file has no `[project] name`
 2. `setup.cfg` — `[metadata] name` (legacy pbr / setuptools projects)
-3. `setup.py` — `name="…"` literal (legacy setuptools)
+3. `setup.py` — the literal `name` keyword passed to `setup()`
+   (legacy setuptools)
+
+The action parses `pyproject.toml` with `tomllib` and reads `setup.py`
+with the `ast` module, so any valid quoting or spacing works, and a
+`name` in an unrelated TOML table (e.g. `[[tool.uv.index]]`) or an
+identifier such as `package_name` does not count. For `setup.py`, the
+action resolves imports and accepts a `setup()` call from a packaging
+module (`setuptools`, `distutils.core`, `numpy.distutils.core` or
+`skbuild`) under any alias; a call such as `helper.setup(name="x")`
+does not count. A `setup.py` name that is not a string literal (e.g.
+`name=NAME`) yields no name.
+
+Without `python3`, or where it cannot parse the file (`tomllib` needs
+Python 3.11+), a best-effort line match stands in: scoped to the
+same TOML tables for `pyproject.toml`, and taking the first quoted
+whole-word `name=` in `setup.py`. For every source, the action
+rejects any name holding characters other than letters, digits, `.`,
+`_` and `-`, and skips a file that holds a raw NUL byte, which none
+of the three formats allows.
 
 This tolerates a `pyproject.toml` that contains a `[build-system]`
 table (PEP 517) but no `[project] name` — the common pbr / setuptools
