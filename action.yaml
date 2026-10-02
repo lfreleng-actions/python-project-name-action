@@ -345,6 +345,7 @@ runs:
         if command -v python3 > /dev/null 2>&1 && \
           name=$(python3 - "$setup_py" "$pep508" <<'PY'
         import ast
+        import contextlib
         import re
         import sys
 
@@ -383,7 +384,9 @@ runs:
 
         # A name's binding is the set of kinds it may refer to, across
         # the control flow paths that reach a point; UNBOUND marks a path
-        # on which it was never bound
+        # on which it was never bound. A def binds its name to a kind of
+        # its own, ("def", id(node)), so a call can tell which function
+        # it reaches.
         UNBOUND = "unbound"
 
 
@@ -490,8 +493,38 @@ runs:
             # leaves a name unbound, so a later call on that path fails
             # rather than reach anything
             kind = UNBOUND if isinstance(node, ast.Delete) else "other"
+            if runs_body_when_called(node):
+                kind = ("def", id(node))
+            aliased = aliased_functions(node, bindings)
             for name in bound_names(node):
                 bind(bindings, name, kind)
+                if aliased:
+                    bindings[name] = aliased
+
+
+        def runs_body_when_called(node):
+            # Whether calling what a def binds runs its body: not when a
+            # decorator may have replaced the function, nor for an async
+            # or generator function, whose call only creates a coroutine
+            # or generator
+            if not isinstance(node, ast.FunctionDef) or node.decorator_list:
+                return False
+            generator = (ast.Yield, ast.YieldFrom)
+            return not any(isinstance(n, generator) for n in body_nodes(node))
+
+
+        def aliased_functions(node, bindings):
+            # x = f, where f can only be functions defined here, makes x
+            # refer to those same functions
+            plain = isinstance(node, ast.Assign) and all(
+                isinstance(target, ast.Name) for target in node.targets
+            )
+            if not plain or not isinstance(node.value, ast.Name):
+                return None
+            found = kinds(bindings, node.value.id)
+            if found and all(isinstance(kind, tuple) for kind in found):
+                return frozenset(found)
+            return None
 
 
         def is_setup(func, bindings):
@@ -585,7 +618,8 @@ runs:
                 yield from own_nodes(statement)
 
 
-        BINDS_BY_NAME = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+        FUNCTIONS = (ast.FunctionDef, ast.AsyncFunctionDef)
+        BINDS_BY_NAME = (*FUNCTIONS, ast.ClassDef)
         COMPREHENSIONS = (
             ast.ListComp,
             ast.SetComp,
@@ -621,6 +655,9 @@ runs:
         SCANNED = (*IMPORTS, ast.Call, *SCANNED_UNITS, *NAME_BINDERS)
         # Statements after which nothing else in their block runs
         TERMINATORS = (ast.Return, ast.Raise, ast.Break, ast.Continue)
+        LOOPS = (ast.For, ast.AsyncFor, ast.While)
+        BREAKS = (ast.Break,)
+        LEAVES = (ast.Break, ast.Continue)
 
 
         def binds_by_name(node):
@@ -677,8 +714,11 @@ runs:
                         return True, name
                     continue
                 if isinstance(node, NAME_BINDERS):
+                    if isinstance(node, ast.ClassDef) and not SETTLING:
+                        run_class_body(node, bindings)
                     bind_definition(node, bindings)
                     continue
+                note_call(node.func, bindings)
                 if SETTLING or not is_setup(node.func, bindings):
                     continue
                 found = True
@@ -689,6 +729,43 @@ runs:
                 if name:
                     return True, name
             return found, ""
+
+
+        def note_call(func, bindings):
+            # Record each function a call by name may reach, against the
+            # scope making the call, and whether the call certainly runs
+            # there and reaches it: only a name bound to that one function
+            # on every path does. An attribute call is not followed: what
+            # x.main() reaches is not known from the name alone.
+            if not isinstance(func, ast.Name):
+                return
+            runs = not (CONDITIONAL or SETTLING or EXITED or any(DOUBTFUL))
+            sole = len(bindings.get(func.id, ())) == 1
+            for kind in kinds(bindings, func.id):
+                if isinstance(kind, tuple):
+                    callees = CALLS.setdefault(SCOPE[-1], {})
+                    certain = runs and sole
+                    callees[kind[1]] = callees.get(kind[1], False) or certain
+
+
+        def run_class_body(node, bindings):
+            # A class body runs where its definition is reached, seeing
+            # the bindings in force there, so scan it then and keep what
+            # it finds. A call in it is made by the enclosing scope, and
+            # is only as certain as the definition. A class scope does not
+            # enclose the scopes nested in it, so a class defined inside
+            # another sees what the outermost one started from.
+            doubtful = bool(CONDITIONAL or EXITED) or any(DOUBTFUL)
+            start = CLASS_START[-1] if CLASS_START else bindings
+            DOUBTFUL.append(doubtful)
+            CLASS_START.append(start)
+            try:
+                found, name, sure, _ = find_setup(node.body, start)
+            finally:
+                DOUBTFUL.pop()
+                CLASS_START.pop()
+            found_here = (SCOPE[-1], found, name, sure and not doubtful)
+            CLASS_RUNS.setdefault(id(node), found_here)
 
 
         def scan_short_circuit(node, bindings):
@@ -758,6 +835,27 @@ runs:
         # One list per scope being scanned, holding its candidates in
         # evaluation order
         CANDIDATES = []
+        # The scope whose code is being scanned: None for module level,
+        # or a function's id; code in a class body belongs to the scope
+        # that defines the class. A scope that is never reached uses
+        # NEVER, so the calls it makes reach nothing.
+        NEVER = "never"
+        SCOPE = [None]
+        # The functions each scope may call, by id, each with whether a
+        # call to it certainly runs there
+        CALLS = {}
+        # One entry per class body being scanned, true when its
+        # definition may not run
+        DOUBTFUL = []
+        # Non-empty after a statement that may have left its block early,
+        # for the rest of that block
+        EXITED = []
+        # One entry per class body being scanned: the bindings of the
+        # scope that defines the outermost one, where it was defined
+        CLASS_START = []
+        # What each class body found when it ran: (its scope,
+        # found a packaging call, its literal name, certainly runs)
+        CLASS_RUNS = {}
 
 
         class Conditional:
@@ -772,18 +870,58 @@ runs:
         def run_block(statements, bindings):
             # Run a block of statements from the given bindings, following
             # control flow, and stop after return, raise, break or continue:
-            # nothing after one of those in the block runs. Return (found a
-            # packaging setup() call, its literal name, the bindings after
-            # the block).
-            found = False
-            for statement in statements:
-                hit, name, bindings = run_statement(statement, bindings)
-                found = found or hit
-                if name:
-                    return True, name, bindings
-                if isinstance(statement, TERMINATORS):
-                    break
+            # nothing after one of those in the block runs. Once a compound
+            # statement may have left the block early, a call in the rest
+            # of it may not run (see note_call). Return (found a packaging
+            # setup() call, its literal name, the bindings after the
+            # block).
+            found, doubtful = False, False
+            try:
+                for statement in statements:
+                    hit, name, bindings = run_statement(statement, bindings)
+                    found = found or hit
+                    if name:
+                        return True, name, bindings
+                    if isinstance(statement, TERMINATORS):
+                        break
+                    if not doubtful and may_exit(statement):
+                        EXITED.append(True)
+                        doubtful = True
+            finally:
+                if doubtful:
+                    EXITED.pop()
             return found, "", bindings
+
+
+        def may_exit(node, *, in_loop=False, caught=False, leaves=LEAVES):
+            # Whether a statement may end its enclosing block early: a
+            # return in this scope, a raise no handler around it here may
+            # catch, or a break or continue (those in leaves) that belongs
+            # to a loop around the block. One in the body of a loop nested
+            # in the statement only leaves that loop; one in such a loop's
+            # else clause still leaves the enclosing one. A raise in the
+            # body of a try with handlers is taken as caught, as any other
+            # statement there that raises is.
+            if isinstance(node, ast.Return):
+                return True
+            if isinstance(node, ast.Raise):
+                return not caught
+            if isinstance(node, (ast.Break, ast.Continue)):
+                return not in_loop and isinstance(node, leaves)
+            if isinstance(node, SKIPPED_SCOPES):
+                return False
+            loop_body = node.body if isinstance(node, LOOPS) else []
+            handled = isinstance(node, TRY_STATEMENTS) and node.handlers
+            guarded = node.body if handled else []
+            return any(
+                may_exit(
+                    child,
+                    in_loop=in_loop or child in loop_body,
+                    caught=caught or child in guarded,
+                    leaves=leaves,
+                )
+                for child in ast.iter_child_nodes(node)
+            )
 
 
         def run_loop(body, bindings, target):
@@ -821,13 +959,15 @@ runs:
 
         def run_try(node, state):
             # The body may raise at any point, so a handler starts from
-            # what held before or after it; else runs after the body, and
-            # finally after every path
+            # what held before or after it; else runs after the body only
+            # if nothing in it raised, which cannot be known here, and
+            # finally runs after every path
             found, name, after_body = run_block(node.body, state)
             if name:
                 return True, name, after_body
             raised = merge(state, after_body)
-            hit, name, after_else = run_block(node.orelse, after_body)
+            with Conditional():
+                hit, name, after_else = run_block(node.orelse, after_body)
             found = found or hit
             if name:
                 return True, name, after_else
@@ -925,7 +1065,11 @@ runs:
             hit, name, after = run_loop(node.body, state, target)
             if name:
                 return True, name, after
-            more, name, after = run_block(node.orelse, after)
+            # The else clause runs only if the body did not leave the loop
+            # by break, return or raise; a continue does not skip it
+            skips_else = any(may_exit(s, leaves=BREAKS) for s in node.body)
+            with Conditional() if skips_else else contextlib.nullcontext():
+                more, name, after = run_block(node.orelse, after)
             return found or hit or more, name, after
 
 
@@ -1026,14 +1170,15 @@ runs:
             # bindings at the end). A call that certainly runs wins; one
             # on a path that may not run is used only when there is none.
             CANDIDATES.append([])
-            saved = list(CONDITIONAL)
+            saved = list(CONDITIONAL), list(EXITED)
             CONDITIONAL.clear()
+            EXITED.clear()
             try:
                 found, name, end = run_block(statements, dict(bindings))
                 candidates = CANDIDATES[-1]
             finally:
                 CANDIDATES.pop()
-                CONDITIONAL[:] = saved
+                CONDITIONAL[:], EXITED[:] = saved
             if name:
                 return True, name, True, end
             if candidates:
@@ -1105,55 +1250,74 @@ runs:
             return local - declared
 
 
-        def search_scopes(scope, inherited, called, results):
+        def search_scopes(scope, inherited, results):
             # Scan each function and class defined in this scope, then the
             # ones nested in them, in source order, adding what each finds
-            # to results. Each starts from what it inherits, so a name bound
-            # in one function never leaks into another. A function sees its
-            # enclosing scope's bindings, with every name it binds anywhere,
+            # to results as (the scope it runs in, certain, name). Each
+            # starts from what it inherits, so a name bound in one function
+            # never leaks into another. A function sees its enclosing
+            # scope's bindings, with every name it binds anywhere,
             # parameters included, local from the start; a class body's own
-            # names are not visible inside its methods.
+            # names are not visible inside its methods. A class body was
+            # scanned where its definition ran; one never reached runs in
+            # no scope.
             nested = filter(binds_by_name, scope_nodes(scope))
             for child in sorted(nested, key=lambda n: (n.lineno, n.col_offset)):
-                start = dict(inherited)
-                if not isinstance(child, ast.ClassDef):
+                if isinstance(child, ast.ClassDef):
+                    ran = CLASS_RUNS.get(id(child))
+                    if ran is None:
+                        ran = (NEVER, *scan_scope(child, inherited, NEVER))
+                    key, found, name, certain = ran[:4]
+                    end = inherited
+                else:
+                    start = dict(inherited)
                     for name in function_locals(child):
                         bind(start, name, UNBOUND)
                     for param in parameters(child):
                         bind(start, param, "other")
-                found, name, certain, bindings = find_setup(child.body, start)
-                # A class body runs when it is defined; a function only if
-                # something calls it
-                runs = isinstance(child, ast.ClassDef) or child.name in called
+                    key = id(child)
+                    found, name, certain, end = scan_scope(child, start, key)
                 if found:
-                    results.append((runs, certain, name))
-                if isinstance(child, ast.ClassDef):
-                    bindings = inherited
-                search_scopes(child, bindings, called, results)
+                    results.append((key, certain, name))
+                search_scopes(child, end, results)
 
 
-        def best_result(results):
-            # Prefer a call the file certainly reaches: a function it calls
-            # over one it never does, and a call that certainly runs within
-            # its body over one on a path that may not
-            for rank in ((1, 1), (1, 0), (0, 1), (0, 0)):
-                for runs, certain, name in results:
-                    if name and (runs, certain) == rank:
-                        return True, name
+        def scan_scope(child, start, key):
+            # Scan a def or class body as the given scope
+            SCOPE.append(key)
+            try:
+                return find_setup(child.body, start)
+            finally:
+                SCOPE.pop()
+
+
+        def reached_scopes():
+            # How surely each scope runs: 2 when a path of calls that
+            # certainly run reaches it from module level, 1 when only a
+            # path through calls that may not run does; others never run
+            level, todo = {None: 2}, [None]
+            while todo:
+                caller = todo.pop()
+                for callee, certain in CALLS.get(caller, {}).items():
+                    reach = min(level[caller], 2 if certain else 1)
+                    if reach > level.get(callee, 0):
+                        level[callee] = reach
+                        todo.append(callee)
+            return level
+
+
+        def best_result(results, reached):
+            # Prefer a call the file certainly reaches: one in a scope that
+            # certainly runs, then one that may, then one that never does;
+            # within each, a call that certainly runs within its body over
+            # one on a path that may not
+            for reach in (2, 1, 0):
+                for sure in (True, False):
+                    for key, certain, name in results:
+                        ranked = (reached.get(key, 0), bool(certain))
+                        if name and ranked == (reach, sure):
+                            return True, name
             return bool(results), ""
-
-
-        def called_names(tree):
-            # Every name the file calls, directly or as an attribute
-            names = set()
-            for node in ast.walk(tree):
-                if isinstance(node, ast.Call):
-                    func = node.func
-                    if isinstance(func, ast.Name):
-                        names.add(func.id)
-                    elif isinstance(func, ast.Attribute):
-                        names.add(func.attr)
-            return names
 
 
         def calls_setup(nodes):
@@ -1170,14 +1334,15 @@ runs:
 
         # Prefer a setup() call made at module level. Only when module
         # level calls no bare setup() (e.g. setup() inside a main() the
-        # file calls) look in function and class bodies too, each with
-        # its own bindings on top of the module's final ones; a
-        # module-level setup() that is not a packaging one stays rejected.
+        # file calls) look in function and class bodies too: a function
+        # with its own bindings on top of the module's final ones, a
+        # class body as it ran. A module-level setup() that is not a
+        # packaging one stays rejected.
         found_call, name, _, module_bindings = find_setup(tree.body, {})
         if not found_call and not calls_setup(scope_nodes(tree)):
             results = []
-            search_scopes(tree, module_bindings, called_names(tree), results)
-            found_call, name = best_result(results)
+            search_scopes(tree, module_bindings, results)
+            found_call, name = best_result(results, reached_scopes())
         # Without a recognised setup() call, report it rather than guess
         # from another call's name= argument.
         if not found_call:

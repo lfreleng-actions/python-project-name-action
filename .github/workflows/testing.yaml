@@ -782,6 +782,193 @@ jobs:
           False and setup(name="wrong-name")
           setup(name="my-project")
           EOF
+          fixture 54 'setup.py class body runs before rebinding' setup.py 'my-project' 'no-python' <<'EOF'
+          from setuptools import setup
+
+
+          class Metadata:
+              setup(name="my-project")
+
+
+          setup = print
+          EOF
+          fixture 55 'setup.py recursion is not a call' setup.py 'my-project' 'no-python' <<'EOF'
+          from setuptools import setup
+
+
+          def unused():
+              unused()
+              setup(name="wrong-name")
+
+
+          def main():
+              setup(name="my-project")
+
+
+          main()
+          EOF
+          fixture 56 'setup.py attribute call does not reach a def' setup.py 'my-project' 'no-python' <<'EOF'
+          import os.path
+
+          from setuptools import setup
+
+
+          def join():
+              setup(name="wrong-name")
+
+
+          def main():
+              setup(name="my-project")
+
+
+          os.path.join("a", "b")
+          main()
+          EOF
+          fixture 57 'setup.py conditional call ranks below a certain one' setup.py 'my-project' 'no-python' <<'EOF'
+          from setuptools import setup
+
+
+          def wrong():
+              setup(name="wrong-name")
+
+
+          def main():
+              setup(name="my-project")
+
+
+          if False:
+              wrong()
+          main()
+          EOF
+          fixture 58 'setup.py generator call does not run its body' setup.py 'my-project' 'no-python' <<'EOF'
+          from setuptools import setup
+
+
+          def wrong():
+              yield
+              setup(name="wrong-name")
+
+
+          def main():
+              setup(name="my-project")
+
+
+          wrong()
+          main()
+          EOF
+          fixture 59 'setup.py nested class skips the outer class scope' setup.py 'my-project' 'no-python' <<'EOF'
+          from setuptools import setup
+
+
+          class Outer:
+              setup = print
+
+              class Inner:
+                  setup(name="my-project")
+          EOF
+          fixture 60 'setup.py call after a possible return' setup.py 'my-project' 'no-python' <<'EOF'
+          from setuptools import setup
+
+
+          def wrong():
+              setup(name="wrong-name")
+
+
+          def main():
+              setup(name="my-project")
+
+
+          def maybe():
+              if True:
+                  return
+              wrong()
+
+
+          maybe()
+          main()
+          EOF
+          fixture 61 'setup.py ambiguous alias call is not certain' setup.py 'my-project' 'no-python' <<'EOF'
+          import os
+
+          from setuptools import setup
+
+
+          def wrong():
+              setup(name="wrong-name")
+
+
+          def main():
+              setup(name="my-project")
+
+
+          if os.environ.get("NEVER_SET_FOR_THIS_TEST"):
+              f = wrong
+          else:
+              f = print
+          f()
+          main()
+          EOF
+          fixture 62 'setup.py nested loop break falls through' setup.py 'my-project' 'no-python' <<'EOF'
+          from setuptools import setup
+
+
+          def wrong():
+              setup(name="wrong-name")
+
+
+          def main():
+              setup(name="my-project")
+
+
+          def hop():
+              if True:
+                  for item in [1]:
+                      break
+              main()
+
+
+          if False:
+              wrong()
+          hop()
+          EOF
+          fixture 63 'setup.py loop else after a break' setup.py 'my-project' 'no-python' <<'EOF'
+          from setuptools import setup
+
+
+          def wrong():
+              setup(name="wrong-name")
+
+
+          def main():
+              setup(name="my-project")
+
+
+          for item in [1]:
+              break
+          else:
+              wrong()
+          main()
+          EOF
+          fixture 64 'setup.py try else after a caught raise' setup.py 'my-project' 'no-python' <<'EOF'
+          from setuptools import setup
+
+
+          def wrong():
+              setup(name="wrong-name")
+
+
+          def main():
+              setup(name="my-project")
+
+
+          try:
+              raise ValueError
+          except ValueError:
+              pass
+          else:
+              wrong()
+          main()
+          EOF
 
       # Invalid names must fail the action, so failures do not stop
       # the job here; the final step checks every outcome and output.
@@ -1162,6 +1349,83 @@ jobs:
         with:
           path_prefix: "f/53/"
 
+      - name: "Run Action [54: setup.py class body runs before rebinding]"
+        id: f54
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/54/"
+
+      - name: "Run Action [55: setup.py recursion is not a call]"
+        id: f55
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/55/"
+
+      - name: "Run Action [56: setup.py attribute call does not reach a def]"
+        id: f56
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/56/"
+
+      - name: "Run Action [57: setup.py conditional call ranks below a certain one]"
+        id: f57
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/57/"
+
+      - name: "Run Action [58: setup.py generator call does not run its body]"
+        id: f58
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/58/"
+
+      - name: "Run Action [59: setup.py nested class skips the outer class scope]"
+        id: f59
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/59/"
+
+      - name: "Run Action [60: setup.py call after a possible return]"
+        id: f60
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/60/"
+
+      - name: "Run Action [61: setup.py ambiguous alias call is not certain]"
+        id: f61
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/61/"
+
+      - name: "Run Action [62: setup.py nested loop break falls through]"
+        id: f62
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/62/"
+
+      - name: "Run Action [63: setup.py loop else after a break]"
+        id: f63
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/63/"
+
+      - name: "Run Action [64: setup.py try else after a caught raise]"
+        id: f64
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/64/"
+
       - name: "Validate Action Output"
         shell: bash
         # One line per fixture: outcome|name|package|source|project_file
@@ -1220,6 +1484,17 @@ jobs:
           RESULT_51: "${{ steps.f51.outcome }}|${{ steps.f51.outputs.python_project_name }}|${{ steps.f51.outputs.python_package_name }}|${{ steps.f51.outputs.source }}|${{ steps.f51.outputs.python_project_file }}"
           RESULT_52: "${{ steps.f52.outcome }}|${{ steps.f52.outputs.python_project_name }}|${{ steps.f52.outputs.python_package_name }}|${{ steps.f52.outputs.source }}|${{ steps.f52.outputs.python_project_file }}"
           RESULT_53: "${{ steps.f53.outcome }}|${{ steps.f53.outputs.python_project_name }}|${{ steps.f53.outputs.python_package_name }}|${{ steps.f53.outputs.source }}|${{ steps.f53.outputs.python_project_file }}"
+          RESULT_54: "${{ steps.f54.outcome }}|${{ steps.f54.outputs.python_project_name }}|${{ steps.f54.outputs.python_package_name }}|${{ steps.f54.outputs.source }}|${{ steps.f54.outputs.python_project_file }}"
+          RESULT_55: "${{ steps.f55.outcome }}|${{ steps.f55.outputs.python_project_name }}|${{ steps.f55.outputs.python_package_name }}|${{ steps.f55.outputs.source }}|${{ steps.f55.outputs.python_project_file }}"
+          RESULT_56: "${{ steps.f56.outcome }}|${{ steps.f56.outputs.python_project_name }}|${{ steps.f56.outputs.python_package_name }}|${{ steps.f56.outputs.source }}|${{ steps.f56.outputs.python_project_file }}"
+          RESULT_57: "${{ steps.f57.outcome }}|${{ steps.f57.outputs.python_project_name }}|${{ steps.f57.outputs.python_package_name }}|${{ steps.f57.outputs.source }}|${{ steps.f57.outputs.python_project_file }}"
+          RESULT_58: "${{ steps.f58.outcome }}|${{ steps.f58.outputs.python_project_name }}|${{ steps.f58.outputs.python_package_name }}|${{ steps.f58.outputs.source }}|${{ steps.f58.outputs.python_project_file }}"
+          RESULT_59: "${{ steps.f59.outcome }}|${{ steps.f59.outputs.python_project_name }}|${{ steps.f59.outputs.python_package_name }}|${{ steps.f59.outputs.source }}|${{ steps.f59.outputs.python_project_file }}"
+          RESULT_60: "${{ steps.f60.outcome }}|${{ steps.f60.outputs.python_project_name }}|${{ steps.f60.outputs.python_package_name }}|${{ steps.f60.outputs.source }}|${{ steps.f60.outputs.python_project_file }}"
+          RESULT_61: "${{ steps.f61.outcome }}|${{ steps.f61.outputs.python_project_name }}|${{ steps.f61.outputs.python_package_name }}|${{ steps.f61.outputs.source }}|${{ steps.f61.outputs.python_project_file }}"
+          RESULT_62: "${{ steps.f62.outcome }}|${{ steps.f62.outputs.python_project_name }}|${{ steps.f62.outputs.python_package_name }}|${{ steps.f62.outputs.source }}|${{ steps.f62.outputs.python_project_file }}"
+          RESULT_63: "${{ steps.f63.outcome }}|${{ steps.f63.outputs.python_project_name }}|${{ steps.f63.outputs.python_package_name }}|${{ steps.f63.outputs.source }}|${{ steps.f63.outputs.python_project_file }}"
+          RESULT_64: "${{ steps.f64.outcome }}|${{ steps.f64.outputs.python_project_name }}|${{ steps.f64.outputs.python_package_name }}|${{ steps.f64.outputs.source }}|${{ steps.f64.outputs.python_project_file }}"
           MODE: ${{ matrix.mode.id }}
         # yamllint enable rule:line-length
         run: |
