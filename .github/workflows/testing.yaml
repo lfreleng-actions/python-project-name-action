@@ -969,6 +969,356 @@ jobs:
               wrong()
           main()
           EOF
+          fixture 65 'setup.py setup after a possible return' setup.py 'my-project' 'no-python' <<'EOF'
+          from setuptools import setup
+
+
+          def wrong():
+              if True:
+                  return
+              setup(name="wrong-name")
+
+
+          def main():
+              setup(name="my-project")
+
+
+          wrong()
+          main()
+          EOF
+          fixture 66 'setup.py raise no handler catches' setup.py 'my-project' 'no-python' <<'EOF'
+          from setuptools import setup
+
+
+          def wrong():
+              setup(name="wrong-name")
+
+
+          def main():
+              setup(name="my-project")
+
+
+          def hop():
+              try:
+                  raise ValueError
+              except KeyError:
+                  pass
+              wrong()
+
+
+          try:
+              hop()
+          except ValueError:
+              pass
+          main()
+          EOF
+          fixture 67 'setup.py sys.exit before a call' setup.py 'my-project' 'no-python' <<'EOF'
+          import sys
+
+          from setuptools import setup
+
+
+          def wrong():
+              setup(name="wrong-name")
+
+
+          def main():
+              setup(name="my-project")
+
+
+          def hop():
+              if True:
+                  sys.exit(0)
+              wrong()
+
+
+          try:
+              hop()
+          except SystemExit:
+              pass
+          main()
+          EOF
+          fixture 68 'setup.py raise caught through a base class' setup.py 'my-project' 'no-python' <<'EOF'
+          from setuptools import setup
+
+
+          def wrong():
+              setup(name="wrong-name")
+
+
+          def main():
+              setup(name="my-project")
+
+
+          def first():
+              if True:
+                  return
+              wrong()
+
+
+          first()
+          try:
+              raise KeyError("missing")
+          except LookupError:
+              pass
+          main()
+          EOF
+          fixture 69 'setup.py sys.exit inside an assignment' setup.py 'my-project' 'no-python' <<'EOF'
+          import sys
+
+          from setuptools import setup
+
+
+          def wrong():
+              setup(name="wrong-name")
+
+
+          def main():
+              setup(name="my-project")
+
+
+          def hop():
+              result = sys.exit(0)
+              wrong()
+
+
+          try:
+              hop()
+          except SystemExit:
+              pass
+          main()
+          EOF
+          fixture 70 'setup.py bare re-raise of SystemExit' setup.py 'my-project' 'no-python' <<'EOF'
+          import sys
+
+          from setuptools import setup
+
+
+          def wrong():
+              setup(name="wrong-name")
+
+
+          def main():
+              setup(name="my-project")
+
+
+          def hop():
+              try:
+                  try:
+                      sys.exit(1)
+                  except SystemExit:
+                      raise
+              except Exception:
+                  pass
+              wrong()
+
+
+          try:
+              hop()
+          except SystemExit:
+              pass
+          main()
+          EOF
+          fixture 71 'setup.py exception class defined in the file' setup.py 'my-project' 'no-python' <<'EOF'
+          from setuptools import setup
+
+
+          def wrong():
+              setup(name="wrong-name")
+
+
+          def main():
+              setup(name="my-project")
+
+
+          def first():
+              if True:
+                  return
+              wrong()
+
+
+          first()
+
+
+          class MissingError(KeyError):
+              pass
+
+
+          try:
+              raise MissingError("missing")
+          except LookupError:
+              pass
+          main()
+          EOF
+          fixture 72 'setup.py exit before a call in one expression' setup.py 'my-project' 'no-python' <<'EOF'
+          import sys
+
+          from setuptools import setup
+
+
+          def wrong():
+              setup(name="wrong-name")
+
+
+          def main():
+              setup(name="my-project")
+
+
+          def hop():
+              return (sys.exit(0), wrong())
+
+
+          try:
+              hop()
+          except SystemExit:
+              pass
+          main()
+          EOF
+          fixture 73 'setup.py exception class defined twice' setup.py 'my-project' 'no-python' <<'EOF'
+          import sys
+
+          from setuptools import setup
+
+
+          def wrong():
+              setup(name="wrong-name")
+
+
+          def main():
+              setup(name="my-project")
+
+
+          class E(KeyError):
+              pass
+
+
+          class E(ValueError):
+              pass
+
+
+          def hop():
+              try:
+                  raise E
+              except LookupError:
+                  pass
+              wrong()
+
+
+          try:
+              hop()
+          except BaseException:
+              pass
+          main()
+          EOF
+          fixture 74 'setup.py exit inside a raise expression' setup.py 'my-project' 'no-python' <<'EOF'
+          import sys
+
+          from setuptools import setup
+
+
+          def wrong():
+              setup(name="wrong-name")
+
+
+          def main():
+              setup(name="my-project")
+
+
+          def hop():
+              try:
+                  raise KeyError(sys.exit(0))
+              except KeyError:
+                  pass
+              wrong()
+
+
+          try:
+              hop()
+          except BaseException:
+              pass
+          main()
+          EOF
+          fixture 75 'setup.py exit in a failing assert message' setup.py 'my-project' 'no-python' <<'EOF'
+          import sys
+
+          from setuptools import setup
+
+
+          def wrong():
+              setup(name="wrong-name")
+
+
+          def main():
+              setup(name="my-project")
+
+
+          def hop():
+              try:
+                  assert False, sys.exit(0)
+              except AssertionError:
+                  pass
+              wrong()
+
+
+          try:
+              hop()
+          except BaseException:
+              pass
+          main()
+          EOF
+          fixture 76 'setup.py imported exception named like a built-in' setup.py 'my-project' 'no-python' <<'EOF'
+          from custom_errors import KeyError
+
+          from setuptools import setup
+
+
+          def wrong():
+              setup(name="wrong-name")
+
+
+          def main():
+              setup(name="my-project")
+
+
+          def hop():
+              try:
+                  raise KeyError
+              except LookupError:
+                  pass
+              wrong()
+
+
+          try:
+              hop()
+          except BaseException:
+              pass
+          main()
+          EOF
+          fixture 77 'setup.py exit inside a chained comparison' setup.py 'my-project' 'no-python' <<'EOF'
+          import sys
+
+          from setuptools import setup
+
+
+          def wrong():
+              setup(name="wrong-name")
+
+
+          def main():
+              setup(name="my-project")
+
+
+          def hop():
+              return 1 < 2 < sys.exit(0) < wrong()
+
+
+          try:
+              hop()
+          except BaseException:
+              pass
+          for _ in [1]:
+              main()
+          EOF
 
       # Invalid names must fail the action, so failures do not stop
       # the job here; the final step checks every outcome and output.
@@ -1426,6 +1776,97 @@ jobs:
         with:
           path_prefix: "f/64/"
 
+      - name: "Run Action [65: setup.py setup after a possible return]"
+        id: f65
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/65/"
+
+      - name: "Run Action [66: setup.py raise no handler catches]"
+        id: f66
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/66/"
+
+      - name: "Run Action [67: setup.py sys.exit before a call]"
+        id: f67
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/67/"
+
+      - name: "Run Action [68: setup.py raise caught through a base class]"
+        id: f68
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/68/"
+
+      - name: "Run Action [69: setup.py sys.exit inside an assignment]"
+        id: f69
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/69/"
+
+      - name: "Run Action [70: setup.py bare re-raise of SystemExit]"
+        id: f70
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/70/"
+
+      - name: "Run Action [71: setup.py exception class defined in the file]"
+        id: f71
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/71/"
+
+      - name: "Run Action [72: setup.py exit before a call in one expression]"
+        id: f72
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/72/"
+
+      - name: "Run Action [73: setup.py exception class defined twice]"
+        id: f73
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/73/"
+
+      - name: "Run Action [74: setup.py exit inside a raise expression]"
+        id: f74
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/74/"
+
+      - name: "Run Action [75: setup.py exit in a failing assert message]"
+        id: f75
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/75/"
+
+      - name: "Run Action [76: setup.py imported exception named like a built-in]"
+        id: f76
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/76/"
+
+      - name: "Run Action [77: setup.py exit inside a chained comparison]"
+        id: f77
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/77/"
+
       - name: "Validate Action Output"
         shell: bash
         # One line per fixture: outcome|name|package|source|project_file
@@ -1495,6 +1936,19 @@ jobs:
           RESULT_62: "${{ steps.f62.outcome }}|${{ steps.f62.outputs.python_project_name }}|${{ steps.f62.outputs.python_package_name }}|${{ steps.f62.outputs.source }}|${{ steps.f62.outputs.python_project_file }}"
           RESULT_63: "${{ steps.f63.outcome }}|${{ steps.f63.outputs.python_project_name }}|${{ steps.f63.outputs.python_package_name }}|${{ steps.f63.outputs.source }}|${{ steps.f63.outputs.python_project_file }}"
           RESULT_64: "${{ steps.f64.outcome }}|${{ steps.f64.outputs.python_project_name }}|${{ steps.f64.outputs.python_package_name }}|${{ steps.f64.outputs.source }}|${{ steps.f64.outputs.python_project_file }}"
+          RESULT_65: "${{ steps.f65.outcome }}|${{ steps.f65.outputs.python_project_name }}|${{ steps.f65.outputs.python_package_name }}|${{ steps.f65.outputs.source }}|${{ steps.f65.outputs.python_project_file }}"
+          RESULT_66: "${{ steps.f66.outcome }}|${{ steps.f66.outputs.python_project_name }}|${{ steps.f66.outputs.python_package_name }}|${{ steps.f66.outputs.source }}|${{ steps.f66.outputs.python_project_file }}"
+          RESULT_67: "${{ steps.f67.outcome }}|${{ steps.f67.outputs.python_project_name }}|${{ steps.f67.outputs.python_package_name }}|${{ steps.f67.outputs.source }}|${{ steps.f67.outputs.python_project_file }}"
+          RESULT_68: "${{ steps.f68.outcome }}|${{ steps.f68.outputs.python_project_name }}|${{ steps.f68.outputs.python_package_name }}|${{ steps.f68.outputs.source }}|${{ steps.f68.outputs.python_project_file }}"
+          RESULT_69: "${{ steps.f69.outcome }}|${{ steps.f69.outputs.python_project_name }}|${{ steps.f69.outputs.python_package_name }}|${{ steps.f69.outputs.source }}|${{ steps.f69.outputs.python_project_file }}"
+          RESULT_70: "${{ steps.f70.outcome }}|${{ steps.f70.outputs.python_project_name }}|${{ steps.f70.outputs.python_package_name }}|${{ steps.f70.outputs.source }}|${{ steps.f70.outputs.python_project_file }}"
+          RESULT_71: "${{ steps.f71.outcome }}|${{ steps.f71.outputs.python_project_name }}|${{ steps.f71.outputs.python_package_name }}|${{ steps.f71.outputs.source }}|${{ steps.f71.outputs.python_project_file }}"
+          RESULT_72: "${{ steps.f72.outcome }}|${{ steps.f72.outputs.python_project_name }}|${{ steps.f72.outputs.python_package_name }}|${{ steps.f72.outputs.source }}|${{ steps.f72.outputs.python_project_file }}"
+          RESULT_73: "${{ steps.f73.outcome }}|${{ steps.f73.outputs.python_project_name }}|${{ steps.f73.outputs.python_package_name }}|${{ steps.f73.outputs.source }}|${{ steps.f73.outputs.python_project_file }}"
+          RESULT_74: "${{ steps.f74.outcome }}|${{ steps.f74.outputs.python_project_name }}|${{ steps.f74.outputs.python_package_name }}|${{ steps.f74.outputs.source }}|${{ steps.f74.outputs.python_project_file }}"
+          RESULT_75: "${{ steps.f75.outcome }}|${{ steps.f75.outputs.python_project_name }}|${{ steps.f75.outputs.python_package_name }}|${{ steps.f75.outputs.source }}|${{ steps.f75.outputs.python_project_file }}"
+          RESULT_76: "${{ steps.f76.outcome }}|${{ steps.f76.outputs.python_project_name }}|${{ steps.f76.outputs.python_package_name }}|${{ steps.f76.outputs.source }}|${{ steps.f76.outputs.python_project_file }}"
+          RESULT_77: "${{ steps.f77.outcome }}|${{ steps.f77.outputs.python_project_name }}|${{ steps.f77.outputs.python_package_name }}|${{ steps.f77.outputs.source }}|${{ steps.f77.outputs.python_project_file }}"
           MODE: ${{ matrix.mode.id }}
         # yamllint enable rule:line-length
         run: |

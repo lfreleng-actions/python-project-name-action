@@ -345,6 +345,7 @@ runs:
         if command -v python3 > /dev/null 2>&1 && \
           name=$(python3 - "$setup_py" "$pep508" <<'PY'
         import ast
+        import builtins
         import contextlib
         import re
         import sys
@@ -381,6 +382,49 @@ runs:
                 return f"{base}.{node.attr}" if base else ""
             return ""
 
+
+        # How setup.py is analysed. The file is never run: its control
+        # flow is followed statically, under these deliberate limits.
+        # - Conditions are not evaluated. Either branch of an if (even
+        #   `if True`), a loop body (any number of times, including none),
+        #   a match case, an except handler, and the else clause of a loop
+        #   or try may or may not run, as may a later and/or operand, a
+        #   conditional expression's branches, a comprehension's body, an
+        #   assert's message and a chained comparison's later operands.
+        # - A statement is taken to complete unless it is, or contains,
+        #   a return, break or continue, or certainly raises: raise,
+        #   sys.exit(), exit(), quit(), or assert on a false constant
+        #   (see raised; python -O, which drops asserts, is not
+        #   considered). An exit call also stops the rest of its own
+        #   expression (see HALTED). That any call may raise is not
+        #   modelled, except that a try's handlers and else clause are
+        #   always uncertain, even where the try body's outcome could be
+        #   told.
+        # - A raise is caught by an enclosing try in the same scope when a
+        #   handler matches it, through the bases of classes this file
+        #   defines (by name, or Outer.Inner inside a class body) and then
+        #   the built-in exception hierarchy (see catches). An exception
+        #   that cannot be told (a bare re-raise, a variable, an imported
+        #   class, a class name defined more than once) is caught only by
+        #   its own name, BaseException or a bare except. Context managers
+        #   are taken not to suppress exceptions.
+        # - Names are resolved from how the file binds them anywhere (see
+        #   binding_origins), not per scope. exit() and quit() count as
+        #   exits unless the file binds those names; sys.exit() through
+        #   import sys [as s] or from sys import exit [as e], when that is
+        #   the only way the file binds the name. A name the file binds
+        #   never takes a built-in exception's hierarchy. os._exit() and
+        #   star imports are not followed.
+        # - Code runs CERTAIN, AFTER_EXIT (after a statement that may have
+        #   left its block) or POSSIBLE (see path_level). The project's
+        #   setup() call is the one most surely reached: by how surely its
+        #   scope runs, then how surely it runs there, then source order.
+        # - Only calls by plain name are followed between functions, and
+        #   only to undecorated, non-async, non-generator functions;
+        #   methods, callbacks and lambdas are not. A function body is
+        #   analysed with the module's final bindings, and a handler starts
+        #   from the bindings before or after its try body, not from those
+        #   at the statement that raised.
 
         # A name's binding is the set of kinds it may refer to, across
         # the control flow paths that reach a point; UNBOUND marks a path
@@ -647,9 +691,10 @@ runs:
             *MATCH_CAPTURES,
         )
         IMPORTS = (ast.Import, ast.ImportFrom)
-        # Expressions whose later parts may not run: and/or stop early,
-        # and a conditional expression runs one of its two branches
-        SHORT_CIRCUITS = (ast.BoolOp, ast.IfExp)
+        # Expressions whose later parts may not run: and/or and a chained
+        # comparison stop early, and a conditional expression runs one
+        # of its two branches
+        SHORT_CIRCUITS = (ast.BoolOp, ast.IfExp, ast.Compare)
         # Expression nodes scanning keeps whole, to handle as units
         SCANNED_UNITS = (*COMPREHENSIONS, *SHORT_CIRCUITS)
         SCANNED = (*IMPORTS, ast.Call, *SCANNED_UNITS, *NAME_BINDERS)
@@ -658,6 +703,23 @@ runs:
         LOOPS = (ast.For, ast.AsyncFor, ast.While)
         BREAKS = (ast.Break,)
         LEAVES = (ast.Break, ast.Continue)
+        # How surely code runs once its scope runs, weakest first: on a
+        # path that may not run, after a statement that may have left the
+        # block early, or certainly
+        POSSIBLE, AFTER_EXIT, CERTAIN = 0, 1, 2
+        # Calls that raise SystemExit, ending the program unless caught
+        # (see EXIT_NAMES)
+        EXIT_BUILTINS = ("exit", "quit")
+        # The one part of each of these statements that runs whenever the
+        # statement is reached (see evaluated_first)
+        HEADER_FIELDS = {
+            ast.If: "test",
+            ast.While: "test",
+            ast.Assert: "test",
+            ast.For: "iter",
+            ast.AsyncFor: "iter",
+            ast.AnnAssign: "value",
+        }
 
 
         def binds_by_name(node):
@@ -704,85 +766,118 @@ runs:
                 if isinstance(node, COMPREHENSIONS):
                     hit, name = scan_comprehension(node, bindings)
                     found = found or hit
-                    if name:
-                        return True, name
+                    if name or HALTED:
+                        return found or bool(name), name
                     continue
                 if isinstance(node, SHORT_CIRCUITS):
                     hit, name = scan_short_circuit(node, bindings)
                     found = found or hit
-                    if name:
-                        return True, name
+                    if name or HALTED:
+                        return found or bool(name), name
                     continue
                 if isinstance(node, NAME_BINDERS):
                     if isinstance(node, ast.ClassDef) and not SETTLING:
                         run_class_body(node, bindings)
                     bind_definition(node, bindings)
                     continue
-                note_call(node.func, bindings)
-                if SETTLING or not is_setup(node.func, bindings):
-                    continue
-                found = True
-                name = literal_name(node)
-                if name and CONDITIONAL:
-                    CANDIDATES[-1].append(name)
-                    continue
+                deferred = id(node) in DEFERRED
+                with Conditional() if deferred else contextlib.nullcontext():
+                    hit, name = scan_call(node, bindings)
+                found = found or hit
+                if is_exit_call(node) and not deferred:
+                    # Nothing evaluated after it in this expression runs
+                    HALTED.append(True)
+                    return found, ""
                 if name:
                     return True, name
             return found, ""
 
 
+        def scan_call(node, bindings):
+            # Judge one call: record the functions it may reach, and
+            # whether it is a packaging setup() call. Return (it is one,
+            # its literal name if it certainly runs); one that may not
+            # run is kept as a candidate instead (see find_setup).
+            note_call(node.func, bindings)
+            if SETTLING or not is_setup(node.func, bindings):
+                return False, ""
+            name = literal_name(node)
+            level = path_level()
+            if name and level < CERTAIN:
+                CANDIDATES[-1].append((level, name))
+                return True, ""
+            return True, name
+
+
         def note_call(func, bindings):
             # Record each function a call by name may reach, against the
-            # scope making the call, and whether the call certainly runs
-            # there and reaches it: only a name bound to that one function
-            # on every path does. An attribute call is not followed: what
-            # x.main() reaches is not known from the name alone.
+            # scope making the call, with how surely the call reaches it:
+            # as surely as the call runs (path_level) when the name is
+            # bound to that one function on every path, and otherwise only
+            # possibly. An attribute call is not followed: what x.main()
+            # reaches is not known from the name alone.
             if not isinstance(func, ast.Name):
                 return
-            runs = not (CONDITIONAL or SETTLING or EXITED or any(DOUBTFUL))
             sole = len(bindings.get(func.id, ())) == 1
+            strength = path_level() if sole else POSSIBLE
             for kind in kinds(bindings, func.id):
                 if isinstance(kind, tuple):
                     callees = CALLS.setdefault(SCOPE[-1], {})
-                    certain = runs and sole
-                    callees[kind[1]] = callees.get(kind[1], False) or certain
+                    callees[kind[1]] = max(callees.get(kind[1], 0), strength)
+
+
+        def path_level():
+            # How surely the code being scanned runs, once its scope runs:
+            # CERTAIN, AFTER_EXIT when only an earlier statement that may
+            # have left its block stands in the way, or POSSIBLE on a path
+            # that may not run. A class body is no surer than the point
+            # where its definition ran.
+            if CONDITIONAL or SETTLING:
+                return POSSIBLE
+            level = AFTER_EXIT if EXITED else CERTAIN
+            return min([level, *(outer for _, outer in CLASS_STACK)])
 
 
         def run_class_body(node, bindings):
             # A class body runs where its definition is reached, seeing
             # the bindings in force there, so scan it then and keep what
             # it finds. A call in it is made by the enclosing scope, and
-            # is only as certain as the definition. A class scope does not
+            # is only as sure as the definition. A class scope does not
             # enclose the scopes nested in it, so a class defined inside
             # another sees what the outermost one started from.
-            doubtful = bool(CONDITIONAL or EXITED) or any(DOUBTFUL)
-            start = CLASS_START[-1] if CLASS_START else bindings
-            DOUBTFUL.append(doubtful)
-            CLASS_START.append(start)
+            outer = path_level()
+            start = CLASS_STACK[0][0] if CLASS_STACK else bindings
+            CLASS_STACK.append((start, outer))
             try:
-                found, name, sure, _ = find_setup(node.body, start)
+                found, name, level, _ = find_setup(node.body, start)
             finally:
-                DOUBTFUL.pop()
-                CLASS_START.pop()
-            found_here = (SCOPE[-1], found, name, sure and not doubtful)
+                CLASS_STACK.pop()
+            found_here = (SCOPE[-1], found, name, min(level, outer))
             CLASS_RUNS.setdefault(id(node), found_here)
 
 
         def scan_short_circuit(node, bindings):
-            # The first operand of and/or, or the test of a conditional
-            # expression, always runs. Each later operand runs only if the
-            # ones before it did not settle the result, and a conditional
-            # expression runs one branch, so calls there are candidates and
-            # their bindings (from :=) merge as ones that may not happen.
-            # Updates bindings in place; returns (found, literal name).
+            # The first operand of and/or, the first two of a chained
+            # comparison, or the test of a conditional expression, always
+            # run. Each later operand runs only if the ones before it did
+            # not settle the result, and a conditional expression runs one
+            # branch, so calls there are candidates and their bindings
+            # (from :=) merge as ones that may not happen. Updates
+            # bindings in place; returns (found, literal name).
             if isinstance(node, ast.IfExp):
-                first, rest = node.test, [node.body, node.orelse]
+                firsts, rest = [node.test], [node.body, node.orelse]
                 chained = False
+            elif isinstance(node, ast.Compare):
+                firsts = [node.left, node.comparators[0]]
+                rest, chained = node.comparators[1:], True
             else:
-                first, rest, chained = node.values[0], node.values[1:], True
-            found, name = scan_events(expression_nodes(first), bindings)
-            if name:
-                return True, name
+                firsts, rest, chained = node.values[:1], node.values[1:], True
+            found, name = False, ""
+            for first in firsts:
+                hit, name = scan_events(expression_nodes(first), bindings)
+                found = found or hit
+                if name or HALTED:
+                    return found or bool(name), name
             ends = [] if not chained else [dict(bindings)]
             current = dict(bindings)
             with Conditional():
@@ -793,6 +888,12 @@ runs:
                     hit, _ = scan_events(expression_nodes(part), state)
                     found = found or hit
                     ends.append(dict(state))
+                    if HALTED:
+                        # An exit here may not happen; when it does, no
+                        # later operand of an and/or runs
+                        HALTED.clear()
+                        if chained:
+                            break
             merged = merge(*ends)
             bindings.clear()
             bindings.update(merged)
@@ -841,18 +942,20 @@ runs:
         # NEVER, so the calls it makes reach nothing.
         NEVER = "never"
         SCOPE = [None]
-        # The functions each scope may call, by id, each with whether a
-        # call to it certainly runs there
+        # The functions each scope may call, by id, each with how surely
+        # a call to it runs there (see path_level)
         CALLS = {}
-        # One entry per class body being scanned, true when its
-        # definition may not run
-        DOUBTFUL = []
+        # One entry per class body being scanned, outermost first: the
+        # bindings where the outermost class was defined, and how surely
+        # that definition ran
+        CLASS_STACK = []
+        # Non-empty after an exit call (see is_exit_call) in code that
+        # always runs: nothing evaluated after it in the statement runs,
+        # and its block ends there
+        HALTED = []
         # Non-empty after a statement that may have left its block early,
         # for the rest of that block
         EXITED = []
-        # One entry per class body being scanned: the bindings of the
-        # scope that defines the outermost one, where it was defined
-        CLASS_START = []
         # What each class body found when it ran: (its scope,
         # found a packaging call, its literal name, certainly runs)
         CLASS_RUNS = {}
@@ -869,12 +972,12 @@ runs:
 
         def run_block(statements, bindings):
             # Run a block of statements from the given bindings, following
-            # control flow, and stop after return, raise, break or continue:
-            # nothing after one of those in the block runs. Once a compound
-            # statement may have left the block early, a call in the rest
-            # of it may not run (see note_call). Return (found a packaging
-            # setup() call, its literal name, the bindings after the
-            # block).
+            # control flow, and stop after one that ends the block (see
+            # ends_block): nothing after it in the block runs. Once a
+            # compound statement may have left the block early, the rest
+            # of it runs only AFTER_EXIT (see path_level). Return (found
+            # a packaging setup() call, its literal name, the bindings
+            # after the block).
             found, doubtful = False, False
             try:
                 for statement in statements:
@@ -882,7 +985,11 @@ runs:
                     found = found or hit
                     if name:
                         return True, name, bindings
-                    if isinstance(statement, TERMINATORS):
+                    if HALTED:
+                        # The statement exited part-way (see scan_events)
+                        HALTED.clear()
+                        break
+                    if ends_block(statement):
                         break
                     if not doubtful and may_exit(statement):
                         EXITED.append(True)
@@ -893,31 +1000,204 @@ runs:
             return found, "", bindings
 
 
-        def may_exit(node, *, in_loop=False, caught=False, leaves=LEAVES):
+        def ends_block(statement):
+            # Whether nothing after this statement in its block runs
+            if isinstance(statement, TERMINATORS):
+                return True
+            return raised(statement) is not None
+
+
+        def raised(statement):
+            # The exception a statement certainly raises, as a dotted name
+            # ("" when it cannot be told), or None when it need not raise.
+            # An exit call among the parts of it that always run (see
+            # always_evaluated) comes first: raise KeyError(sys.exit())
+            # raises SystemExit. Then a raise, or an assert on a false
+            # constant.
+            for part in evaluated_first(statement):
+                for node in always_evaluated(part):
+                    if is_exit_call(node):
+                        return "SystemExit"
+            return raises_here(statement)
+
+
+        def raises_here(node):
+            # The exception this node itself raises when it runs: a raise,
+            # an assert on a false constant, or an exit call
+            if isinstance(node, ast.Raise):
+                exc = node.exc
+                exc = exc.func if isinstance(exc, ast.Call) else exc
+                return dotted(exc) if exc is not None else ""
+            if fails_assert(node):
+                return "AssertionError"
+            return "SystemExit" if is_exit_call(node) else None
+
+
+        def fails_assert(node):
+            # An assert whose test is a false constant, which always fails
+            test = getattr(node, "test", None)
+            is_assert = isinstance(node, ast.Assert) and is_constant(test)
+            return is_assert and not test.value
+
+
+        def is_exit_call(node):
+            # A call to sys.exit(), exit() or quit(), however the file
+            # names it (see EXIT_NAMES)
+            is_call = isinstance(node, ast.Call)
+            return is_call and dotted(node.func) in EXIT_NAMES
+
+
+        def is_constant(node):
+            return isinstance(node, ast.Constant)
+
+
+        def evaluated_first(statement):
+            # The parts of a statement that run whenever it is reached: a
+            # compound statement's header, an assert's test (and its
+            # message when the test is a false constant, as it then always
+            # runs), an annotated assignment's value (its annotation is not
+            # reliably evaluated), or all of any other simple statement
+            if isinstance(statement, (ast.With, ast.AsyncWith)):
+                return [item.context_expr for item in statement.items]
+            if isinstance(statement, MATCH_STATEMENTS):
+                return [statement.subject]
+            if fails_assert(statement) and statement.msg:
+                return [statement.test, statement.msg]
+            field = HEADER_FIELDS.get(type(statement))
+            if field:
+                return [part for part in [getattr(statement, field)] if part]
+            if compound_runner(statement) is not None:
+                return []
+            return [statement]
+
+
+        def always_evaluated(node):
+            # A node and the nodes beneath it that run whenever it does:
+            # only the first operand of and/or, the test of a conditional
+            # expression, the first two operands of a chained comparison,
+            # the first iterable of a comprehension, and the header of a
+            # def or lambda. A class body runs where it is defined, so its
+            # statements count too.
+            yield node
+            if isinstance(node, ast.BoolOp):
+                children = node.values[:1]
+            elif isinstance(node, ast.IfExp):
+                children = [node.test]
+            elif isinstance(node, ast.Compare):
+                children = [node.left, node.comparators[0]]
+            elif isinstance(node, COMPREHENSIONS):
+                children = [node.generators[0].iter]
+            elif isinstance(node, ast.ClassDef):
+                body = [p for s in node.body for p in evaluated_first(s)]
+                children = header_expressions(node) + body
+            elif isinstance(node, SKIPPED_SCOPES):
+                children = header_expressions(node)
+            else:
+                children = ast.iter_child_nodes(node)
+            for child in children:
+                yield from always_evaluated(child)
+
+
+        def escapes(exception, handlers):
+            # Whether a raised exception (None for none) gets past every
+            # enclosing try's handlers
+            if exception is None:
+                return False
+            return not any(catches(h, exception) for h in handlers)
+
+
+        def catches(handlers, exception):
+            # Whether one of a try's handlers catches the named exception
+            # (see handles); a bare except catches anything
+            for handler in handlers:
+                if handler.type is None:
+                    return True
+                types = handler.type
+                types = types.elts if isinstance(types, ast.Tuple) else [types]
+                if any(handles(dotted(t), exception) for t in types):
+                    return True
+            return False
+
+
+        def handles(caught, exception):
+            # Whether `except caught` catches the named exception. A class
+            # this file defines is followed through its bases, and the
+            # built-in classes reached follow Python's own hierarchy, so
+            # except LookupError catches KeyError and except Exception does
+            # not catch SystemExit. An exception that cannot be told (a
+            # bare re-raise, a variable, an imported class) is caught only
+            # by its own name or BaseException.
+            if caught == "BaseException":
+                return True
+            lineage = exception_lineage(exception)
+            if caught in lineage:
+                return True
+            handler = builtin_exception(caught)
+            if handler is None:
+                return False
+            known = [c for c in map(builtin_exception, lineage) if c]
+            return any(issubclass(c, handler) for c in known)
+
+
+        def exception_lineage(name):
+            # An exception's name and those of its bases, through the
+            # classes this file defines. A class defined more than once
+            # cannot be told apart here, so its name is followed no
+            # further.
+            lineage, todo = set(), [name] if name else []
+            while todo:
+                current = todo.pop()
+                if current not in lineage:
+                    lineage.add(current)
+                    todo.extend(CLASS_BASES.get(current) or ())
+            return lineage
+
+
+        def builtin_exception(name):
+            # The built-in exception class with this name, if there is one
+            # and nothing in the file binds the name itself (an import,
+            # assignment, def or class may shadow it)
+            if not name or name in ORIGINS:
+                return None
+            found = getattr(builtins, name, None)
+            if isinstance(found, type) and issubclass(found, BaseException):
+                return found
+            return None
+
+
+        def may_exit(node, *, in_loop=False, handlers=(), leaves=LEAVES):
             # Whether a statement may end its enclosing block early: a
-            # return in this scope, a raise no handler around it here may
-            # catch, or a break or continue (those in leaves) that belongs
-            # to a loop around the block. One in the body of a loop nested
-            # in the statement only leaves that loop; one in such a loop's
-            # else clause still leaves the enclosing one. A raise in the
-            # body of a try with handlers is taken as caught, as any other
-            # statement there that raises is.
+            # return in this scope, a statement that raises (see raised)
+            # unless a try around it here catches the exception, or a
+            # break or continue (those in leaves) that belongs to a loop
+            # around the block. One in the body of a loop nested in the
+            # statement only leaves that loop; one in such a loop's else
+            # clause still leaves the enclosing one. handlers holds the
+            # handler lists of the try statements whose bodies enclose
+            # the node.
             if isinstance(node, ast.Return):
                 return True
-            if isinstance(node, ast.Raise):
-                return not caught
+            if escapes(raises_here(node), handlers):
+                return True
             if isinstance(node, (ast.Break, ast.Continue)):
                 return not in_loop and isinstance(node, leaves)
             if isinstance(node, SKIPPED_SCOPES):
-                return False
+                # Only the header runs here (see header_expressions), and
+                # a class body, which runs where it is defined
+                parts = header_expressions(node)
+                if isinstance(node, ast.ClassDef):
+                    parts = parts + node.body
+                nested = {"handlers": handlers, "leaves": leaves}
+                return any(may_exit(part, **nested) for part in parts)
             loop_body = node.body if isinstance(node, LOOPS) else []
-            handled = isinstance(node, TRY_STATEMENTS) and node.handlers
-            guarded = node.body if handled else []
+            guarded = isinstance(node, TRY_STATEMENTS) and node.handlers
+            guarded_body = node.body if guarded else []
+            inner = (*handlers, node.handlers) if guarded else handlers
             return any(
                 may_exit(
                     child,
                     in_loop=in_loop or child in loop_body,
-                    caught=caught or child in guarded,
+                    handlers=inner if child in guarded_body else handlers,
                     leaves=leaves,
                 )
                 for child in ast.iter_child_nodes(node)
@@ -992,8 +1272,9 @@ runs:
             if handler.type is not None:
                 hit, name = scan_events(expression_nodes(handler.type), state)
                 found = found or hit
-                if name:
-                    return True, name, state
+                if name or HALTED:
+                    HALTED.clear()
+                    return found or bool(name), name, state
             if handler.name:
                 bind(state, handler.name, "other")
             hit, name, end = run_block(handler.body, state)
@@ -1007,8 +1288,8 @@ runs:
             # Each case starts from the state before the match, binding its
             # pattern's captures; when no case matches, nothing is bound
             found, name = scan_events(expression_nodes(node.subject), state)
-            if name:
-                return True, name, state
+            if name or HALTED:
+                return found or bool(name), name, state
             ends = [state]
             for case in node.cases:
                 # A case runs only if its pattern matches
@@ -1029,8 +1310,9 @@ runs:
             for part in parts:
                 hit, name = scan_events(expression_nodes(part), state)
                 found = found or hit
-                if name:
-                    return True, name, state
+                if name or HALTED:
+                    HALTED.clear()
+                    return found or bool(name), name, state
             hit, name, end = run_block(case.body, state)
             return found or hit, name, end
 
@@ -1039,8 +1321,8 @@ runs:
             # Evaluate a test, then run each alternative branch from the
             # resulting state and merge where they meet
             found, name = scan_events(expression_nodes(test), state)
-            if name:
-                return True, name, state
+            if name or HALTED:
+                return found or bool(name), name, state
             ends = []
             for branch in branches:
                 # Each branch runs only if the test selects it
@@ -1059,8 +1341,8 @@ runs:
             is_for = not isinstance(node, ast.While)
             head = node.iter if is_for else node.test
             found, name = scan_events(expression_nodes(head), state)
-            if name:
-                return True, name, state
+            if name or HALTED:
+                return found or bool(name), name, state
             target = node.target if is_for else None
             hit, name, after = run_loop(node.body, state, target)
             if name:
@@ -1081,8 +1363,8 @@ runs:
                 context = expression_nodes(item.context_expr)
                 hit, name = scan_events(context, state)
                 found = found or hit
-                if name:
-                    return True, name, state
+                if name or HALTED:
+                    return found or bool(name), name, state
                 for target in target_names(item.optional_vars):
                     bind(state, target, "other")
             hit, name, state = run_block(node.body, state)
@@ -1158,6 +1440,12 @@ runs:
                 found = found or hit
                 if name:
                     return True, name
+                if HALTED and index == 0:
+                    return found, ""
+                if HALTED:
+                    # An exit per item may not happen: there may be none
+                    HALTED.clear()
+                    break
             for walrus in comprehension_walruses(node):
                 bind_definition(walrus, enclosing)
             return found, ""
@@ -1166,24 +1454,27 @@ runs:
         def find_setup(statements, bindings):
             # Run one scope's statements, starting from the bindings it
             # inherits. Return (found a packaging setup() call, its
-            # literal name, whether that call certainly runs, the scope's
-            # bindings at the end). A call that certainly runs wins; one
-            # on a path that may not run is used only when there is none.
+            # literal name, how surely that call runs within the scope
+            # (see path_level), the scope's bindings at the end). The first
+            # call that certainly runs wins; otherwise the surest of the
+            # others, the earliest among equals.
             CANDIDATES.append([])
-            saved = list(CONDITIONAL), list(EXITED)
+            saved = list(CONDITIONAL), list(EXITED), list(HALTED)
             CONDITIONAL.clear()
             EXITED.clear()
+            HALTED.clear()
             try:
                 found, name, end = run_block(statements, dict(bindings))
                 candidates = CANDIDATES[-1]
             finally:
                 CANDIDATES.pop()
-                CONDITIONAL[:], EXITED[:] = saved
+                CONDITIONAL[:], EXITED[:], HALTED[:] = saved
             if name:
-                return True, name, True, end
+                return True, name, CERTAIN, end
             if candidates:
-                return True, candidates[0], False, end
-            return found, "", False, end
+                level, name = max(candidates, key=lambda c: c[0])
+                return True, name, level, end
+            return found, "", POSSIBLE, end
 
 
         def parameters(function):
@@ -1253,7 +1544,8 @@ runs:
         def search_scopes(scope, inherited, results):
             # Scan each function and class defined in this scope, then the
             # ones nested in them, in source order, adding what each finds
-            # to results as (the scope it runs in, certain, name). Each
+            # to results as (the scope it runs in, how surely the call runs
+            # within it, name). Each
             # starts from what it inherits, so a name bound in one function
             # never leaks into another. A function sees its enclosing
             # scope's bindings, with every name it binds anywhere,
@@ -1267,7 +1559,7 @@ runs:
                     ran = CLASS_RUNS.get(id(child))
                     if ran is None:
                         ran = (NEVER, *scan_scope(child, inherited, NEVER))
-                    key, found, name, certain = ran[:4]
+                    key, found, name, level = ran[:4]
                     end = inherited
                 else:
                     start = dict(inherited)
@@ -1276,9 +1568,9 @@ runs:
                     for param in parameters(child):
                         bind(start, param, "other")
                     key = id(child)
-                    found, name, certain, end = scan_scope(child, start, key)
+                    found, name, level, end = scan_scope(child, start, key)
                 if found:
-                    results.append((key, certain, name))
+                    results.append((key, level, name))
                 search_scopes(child, end, results)
 
 
@@ -1292,14 +1584,15 @@ runs:
 
 
         def reached_scopes():
-            # How surely each scope runs: 2 when a path of calls that
-            # certainly run reaches it from module level, 1 when only a
-            # path through calls that may not run does; others never run
-            level, todo = {None: 2}, [None]
+            # How surely each scope runs: module level always does, and a
+            # function as surely as the best path of calls to it allows,
+            # each call counting as surely as it runs (see path_level).
+            # Levels are a call's level plus one, so 0 means never.
+            level, todo = {None: CERTAIN + 1}, [None]
             while todo:
                 caller = todo.pop()
-                for callee, certain in CALLS.get(caller, {}).items():
-                    reach = min(level[caller], 2 if certain else 1)
+                for callee, strength in CALLS.get(caller, {}).items():
+                    reach = min(level[caller], strength + 1)
                     if reach > level.get(callee, 0):
                         level[callee] = reach
                         todo.append(callee)
@@ -1307,16 +1600,13 @@ runs:
 
 
         def best_result(results, reached):
-            # Prefer a call the file certainly reaches: one in a scope that
-            # certainly runs, then one that may, then one that never does;
-            # within each, a call that certainly runs within its body over
-            # one on a path that may not
-            for reach in (2, 1, 0):
-                for sure in (True, False):
-                    for key, certain, name in results:
-                        ranked = (reached.get(key, 0), bool(certain))
-                        if name and ranked == (reach, sure):
-                            return True, name
+            # Prefer the call the file most surely reaches: by how surely
+            # its scope runs, then by how surely the call runs within it,
+            # then the earliest
+            ranked = [(reached.get(k, 0), lvl, n) for k, lvl, n in results]
+            ranked = [entry for entry in ranked if entry[2]]
+            if ranked:
+                return True, max(ranked, key=lambda r: r[:2])[2]
             return bool(results), ""
 
 
@@ -1338,6 +1628,88 @@ runs:
         # with its own bindings on top of the module's final ones, a
         # class body as it ran. A module-level setup() that is not a
         # packaging one stays rejected.
+        # The bases each class this file defines names, by class name,
+        # to match raised exceptions against handlers (see handles);
+        # None for a name defined more than once. DEFERRED holds the
+        # ids of the nodes in an assert's message, which runs only when
+        # the assert fails.
+        CLASS_BASES, DEFERRED = {}, set()
+
+
+        def index_classes(node, prefix=""):
+            # Record each class's bases under the name code reaches it by:
+            # Outer.Inner for one nested in a class body, its own name
+            # otherwise. A name defined more than once maps to None.
+            for child in ast.iter_child_nodes(node):
+                inner = "" if isinstance(child, FUNCTIONS) else prefix
+                if isinstance(child, ast.ClassDef):
+                    name = prefix + child.name
+                    bases = list(filter(None, map(dotted, child.bases)))
+                    repeated = name in CLASS_BASES
+                    CLASS_BASES[name] = None if repeated else bases
+                    inner = name + "."
+                index_classes(child, inner)
+
+
+        index_classes(tree)
+
+
+        def binding_origins(root):
+            # How the file binds each name, anywhere in it: ("module", m)
+            # for import m, ("from", m, x) for from m import x, and OTHER
+            # for anything else (an assignment, def, class, parameter,
+            # handler or match capture). A star import is not followed.
+            origins = {}
+            for node in ast.walk(root):
+                for name, origin in origins_of(node):
+                    origins.setdefault(name, set()).add(origin)
+            return origins
+
+
+        def origins_of(node):
+            # The (name, origin) pairs one node binds (see binding_origins)
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    root = alias.name.split(".")[0]
+                    module = alias.name if alias.asname else root
+                    yield alias.asname or root, ("module", module)
+            elif isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    if alias.name != "*":
+                        local = alias.asname or alias.name
+                        yield local, ("from", node.module, alias.name)
+            elif isinstance(node, ast.Name):
+                if not isinstance(node.ctx, ast.Load):
+                    yield node.id, OTHER
+            elif isinstance(node, ast.arg):
+                yield node.arg, OTHER
+            elif isinstance(node, NAMED_BINDERS):
+                for name in bound_names(node):
+                    yield name, OTHER
+
+
+        # Every name the file binds, with how (see binding_origins), and
+        # the names a call to sys.exit(), exit() or quit() goes by here:
+        # exit and quit while nothing in the file binds them, and those
+        # bound only by import sys [as s] or from sys import exit [as e]
+        OTHER = ("other",)
+        # Nodes that bind a name of their own: a def, class, except ... as
+        # or match capture
+        NAMED_BINDERS = (*BINDS_BY_NAME, ast.ExceptHandler, *MATCH_CAPTURES)
+        ORIGINS = binding_origins(tree)
+        EXIT_NAMES = {name for name in EXIT_BUILTINS if name not in ORIGINS}
+        for local, ways in ORIGINS.items():
+            if ways == {("module", "sys")}:
+                EXIT_NAMES.add(f"{local}.exit")
+            if ways == {("from", "sys", "exit")}:
+                EXIT_NAMES.add(local)
+        for definition in ast.walk(tree):
+            # An assert's message runs only when it fails; a false
+            # constant test always does (see evaluated_first)
+            message = getattr(definition, "msg", None)
+            failing = fails_assert(definition)
+            if isinstance(definition, ast.Assert) and message and not failing:
+                DEFERRED.update(map(id, ast.walk(message)))
         found_call, name, _, module_bindings = find_setup(tree.body, {})
         if not found_call and not calls_setup(scope_nodes(tree)):
             results = []
