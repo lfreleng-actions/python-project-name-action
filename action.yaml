@@ -105,10 +105,14 @@ runs:
         # the whole string before printing it: command substitution
         # drops NUL bytes, so a check made only after capture would
         # accept "foo\u0000bar" as "foobar".
+        #
+        # -I keeps the working directory (the caller's workspace) off
+        # sys.path, so a re.py or tomllib.py there is not imported in
+        # place of the standard library module.
         pep508='^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$'
         parsed="false"
         if command -v python3 > /dev/null 2>&1 && \
-          name=$(python3 - "$toml" "$pep508" <<'PY'
+          name=$(python3 -I - "$toml" "$pep508" <<'PY'
         import re
         import sys
 
@@ -339,11 +343,12 @@ runs:
         # (e.g. name=NAME) yields no name rather than a wrong one. As in
         # the pyproject.toml step, the parser applies the PEP 508-style
         # check before printing, since command substitution drops NUL
-        # bytes and would turn "foo\x00bar" into "foobar".
+        # bytes and would turn "foo\x00bar" into "foobar". -I keeps
+        # the caller's workspace off sys.path, as above.
         pep508='^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$'
         parsed="false"
         if command -v python3 > /dev/null 2>&1 && \
-          name=$(python3 - "$setup_py" "$pep508" <<'PY'
+          name=$(python3 -I - "$setup_py" "$pep508" <<'PY'
         import ast
         import contextlib
         import re
