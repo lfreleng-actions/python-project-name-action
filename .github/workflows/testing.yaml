@@ -318,6 +318,106 @@ jobs:
             exit 1
           fi
 
+  ### Workspace modules must not replace the parsers' imports ###
+  # The parsers run with the caller's workspace as the working
+  # directory. Plant modules there that the parsers import; each one
+  # records that it ran and exits non-zero. The action must still
+  # return the real names, and no planted module may run. The
+  # PYTHONPATH run adds an empty entry, which would also put the
+  # working directory on sys.path and load sitecustomize.py from it.
+  workspace-modules:
+    name: "Workspace Module Isolation"
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    timeout-minutes: 5
+    steps:
+      - name: "Plant workspace modules and fixtures"
+        shell: bash
+        run: |
+          # Plant workspace modules and fixtures
+          for module in re tomllib ast contextlib sitecustomize; do
+            cat > "$module.py" <<'EOF'
+          import os
+          import sys
+
+          marker = os.path.join(os.environ["RUNNER_TEMP"], "planted-ran")
+          fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+          os.write(fd, (__name__ + "\n").encode())
+          os.close(fd)
+          sys.exit(97)
+          EOF
+          done
+          mkdir -p isolation-pyproject isolation-setup-py
+          cat > isolation-pyproject/pyproject.toml <<'EOF'
+          [project]
+          name = "isolated-pyproject"
+          version = "0.1.0"
+          EOF
+          cat > isolation-setup-py/setup.py <<'EOF'
+          from setuptools import setup
+
+          setup(name="isolated-setup-py")
+          EOF
+
+      - name: "Run Action [pyproject.toml with workspace modules]"
+        id: pyproject
+        uses: $/
+        with:
+          path_prefix: "isolation-pyproject/"
+
+      - name: "Run Action [setup.py with workspace modules]"
+        id: setup-py
+        uses: $/
+        with:
+          path_prefix: "isolation-setup-py/"
+
+      - name: "Run Action [pyproject.toml with an empty PYTHONPATH entry]"
+        id: pythonpath
+        uses: $/
+        env:
+          PYTHONPATH: ":"
+        with:
+          path_prefix: "isolation-pyproject/"
+
+      - name: "Validate Action Output: workspace modules"
+        shell: bash
+        env:
+          PYPROJECT_NAME: ${{ steps.pyproject.outputs.python_project_name }}
+          PYPROJECT_SOURCE: ${{ steps.pyproject.outputs.source }}
+          SETUP_PY_NAME: ${{ steps.setup-py.outputs.python_project_name }}
+          SETUP_PY_SOURCE: ${{ steps.setup-py.outputs.source }}
+          PYTHONPATH_NAME: ${{ steps.pythonpath.outputs.python_project_name }}
+        run: |
+          # Validate that no workspace module ran
+          ERROR=""
+          if [ "$PYPROJECT_NAME" != "isolated-pyproject" ] ||
+            [ "$PYPROJECT_SOURCE" != "pyproject.toml" ]; then
+            echo "Unexpected pyproject.toml result:" \
+              "$PYPROJECT_NAME ($PYPROJECT_SOURCE) ❌"
+            ERROR="true"
+          fi
+          if [ "$SETUP_PY_NAME" != "isolated-setup-py" ] ||
+            [ "$SETUP_PY_SOURCE" != "setup.py" ]; then
+            echo "Unexpected setup.py result:" \
+              "$SETUP_PY_NAME ($SETUP_PY_SOURCE) ❌"
+            ERROR="true"
+          fi
+          if [ "$PYTHONPATH_NAME" != "isolated-pyproject" ]; then
+            echo "Unexpected PYTHONPATH run result: $PYTHONPATH_NAME ❌"
+            ERROR="true"
+          fi
+          if [ -e "$RUNNER_TEMP/planted-ran" ]; then
+            echo "Workspace modules ran in the parsers:"
+            cat "$RUNNER_TEMP/planted-ran"
+            ERROR="true"
+          fi
+          if [ "$ERROR" != "true" ]; then
+            echo "No workspace module ran ✅"
+          else
+            exit 1
+          fi
+
   ### Name extraction: quoting, spacing, scoping and parser modes ###
   # Every fixture runs in every parser mode: tomllib on the runner's
   # own Python, a real Python 3.10 (no tomllib, so pyproject.toml uses
@@ -352,7 +452,7 @@ jobs:
           # an image change cannot silently skip a parser path
           if command -v python3 > /dev/null 2>&1; then
             python3 --version
-            if python3 -c 'import tomllib' 2> /dev/null; then
+            if python3 -I -c 'import tomllib' 2> /dev/null; then
               actual="tomllib"
             else
               actual="no-tomllib"
