@@ -70,6 +70,23 @@ runs:
           printf '%s\n' "$delimiter"
         } >> "$GITHUB_OUTPUT"
 
+    # Provide the interpreter the parsers run, rather than whichever
+    # python3 comes first on the caller's PATH. update-environment:
+    # false leaves the caller's PATH and environment untouched; the
+    # parsers start this interpreter through its python-path output.
+    # tomllib needs Python 3.11+, so request that range: "3.x" may
+    # resolve to an older interpreter from the runner's tool cache.
+    # Where no such interpreter can be provided, carry on: the setup.cfg
+    # step needs no Python, and the other parsers fall back to their
+    # line matches rather than to the caller's python3.
+    # yamllint disable-line rule:line-length
+    - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+      id: setup-python
+      continue-on-error: true
+      with:
+        python-version: ">=3.11"
+        update-environment: false
+
     # Check for pyproject.toml first (preferred)
     # yamllint disable-line rule:line-length
     - uses: lfreleng-actions/path-check-action@fb77045699ead7bb7014186ae23e4935ce277a21 # v0.2.3
@@ -83,6 +100,7 @@ runs:
       shell: bash
       env:
         ENV_PATH_PREFIX: ${{ steps.setup.outputs.path_prefix }}
+        PYTHON: ${{ steps.setup-python.outputs.python-path }}
       run: |
         # Extract the project name from pyproject.toml
         #
@@ -108,11 +126,19 @@ runs:
         #
         # -I keeps the working directory (the caller's workspace) off
         # sys.path, so a re.py or tomllib.py there is not imported in
-        # place of the standard library module.
+        # place of the standard library module. $PYTHON is the
+        # interpreter setup-python provided, not one the caller's PATH
+        # selects. It finds libpython through an absolute rpath under
+        # /opt/hostedtoolcache, which a job container mounts elsewhere,
+        # so name its library directory, as update-environment would.
+        # When setup-python failed, $PYTHON is empty: use the fallback.
+        pylib="${PYTHON%/bin/python}/lib"
         pep508='^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$'
         parsed="false"
-        if command -v python3 > /dev/null 2>&1 && \
-          name=$(python3 -I - "$toml" "$pep508" <<'PY'
+        if [ -z "$PYTHON" ] || [ ! -x "$PYTHON" ]; then
+          echo "No Python interpreter from setup-python ⚠️"
+        elif name=$(LD_LIBRARY_PATH="$pylib" \
+          "$PYTHON" -I - "$toml" "$pep508" <<'PY'
         import re
         import sys
 
@@ -147,9 +173,9 @@ runs:
           ); then
           parsed="true"
         fi
-        # Without Python 3.11+, or when tomllib rejects the file, fall
-        # back to a line-based match scoped to the same two tables that
-        # accepts either quote style and any whitespace around `=`.
+        # Without that interpreter, or when tomllib rejects the file,
+        # fall back to a line-based match scoped to the same two tables
+        # that accepts either quote style and any whitespace around `=`.
         # TOML forbids raw NUL bytes, and some awk implementations pass
         # them through for command substitution to drop, so skip the
         # fallback for any file that holds one.
@@ -333,6 +359,7 @@ runs:
       shell: bash
       env:
         ENV_PATH_PREFIX: ${{ steps.setup.outputs.path_prefix }}
+        PYTHON: ${{ steps.setup-python.outputs.python-path }}
       run: |
         # Extract the name passed to setup() in setup.py
 
@@ -344,11 +371,16 @@ runs:
         # the pyproject.toml step, the parser applies the PEP 508-style
         # check before printing, since command substitution drops NUL
         # bytes and would turn "foo\x00bar" into "foobar". -I keeps
-        # the caller's workspace off sys.path, as above.
+        # the caller's workspace off sys.path, and $PYTHON is the
+        # setup-python interpreter, started with its library directory,
+        # as above; when setup-python failed, use the fallback.
+        pylib="${PYTHON%/bin/python}/lib"
         pep508='^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$'
         parsed="false"
-        if command -v python3 > /dev/null 2>&1 && \
-          name=$(python3 -I - "$setup_py" "$pep508" <<'PY'
+        if [ -z "$PYTHON" ] || [ ! -x "$PYTHON" ]; then
+          echo "No Python interpreter from setup-python ⚠️"
+        elif name=$(LD_LIBRARY_PATH="$pylib" \
+          "$PYTHON" -I - "$setup_py" "$pep508" <<'PY'
         import ast
         import contextlib
         import re
@@ -1365,9 +1397,9 @@ runs:
           ); then
           parsed="true"
         fi
-        # Without a usable Python, or when setup.py does not parse
-        # (e.g. Python 2 syntax), fall back to the first quoted
-        # `name=` whose `name` is not the tail of a longer identifier.
+        # Without that interpreter, or when setup.py does not parse
+        # (e.g. Python 2 syntax), fall back to the first quoted `name=`
+        # whose `name` is not the tail of a longer identifier.
         # Python rejects raw NUL bytes in source, and some awk
         # implementations pass them through for command substitution
         # to drop, so skip the fallback for any file that holds one.

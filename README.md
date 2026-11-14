@@ -30,9 +30,14 @@ module (`setuptools`, `distutils.core`, `numpy.distutils.core` or
 does not count. A `setup.py` name that is not a string literal (e.g.
 `name=NAME`) yields no name.
 
-Without `python3`, or where it cannot parse the file (`tomllib` needs
-Python 3.11+), a best-effort line match stands in: scoped to the
-same TOML tables for `pyproject.toml`, and taking the first quoted
+The action runs these parsers with a Python 3.11 or newer interpreter
+it sets up itself through `actions/setup-python`, rather than whichever
+`python3` comes first on the caller's `PATH`, and leaves the caller's
+`PATH` and environment unchanged. Where a parser cannot read the file
+(e.g. a `setup.py` in Python 2 syntax), or the action cannot set up
+that interpreter or run it in the job's container, a best-effort line
+match stands in, never the caller's `python3`. That match reads the
+same TOML tables for `pyproject.toml`, and takes the first quoted
 whole-word `name=` in `setup.py`. For every source, the action
 rejects any name holding characters other than letters, digits, `.`,
 `_` and `-`, and skips a file that holds a raw NUL byte, which none
