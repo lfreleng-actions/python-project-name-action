@@ -376,7 +376,7 @@ jobs:
         id: pythonpath
         uses: $/
         env:
-          PYTHONPATH: ":"
+          PYTHONPATH: ":" # python-path-ok -- the empty entry is the test input
         with:
           path_prefix: "isolation-pyproject/"
 
