@@ -418,11 +418,15 @@ jobs:
             exit 1
           fi
 
-  ### Name extraction: quoting, spacing, scoping and parser modes ###
-  # Every fixture runs in every parser mode: tomllib on the runner's
-  # own Python, a real Python 3.10 (no tomllib, so pyproject.toml uses
-  # the awk fallback), and an image with no python3 at all (awk
-  # fallback for both pyproject.toml and setup.py).
+  ### Name extraction: quoting, spacing, scoping and parser paths ###
+  # Every fixture runs on each parser path. The parsers start the
+  # interpreter setup-python provides, never the caller's python3, so
+  # the legs differ in what setup-python finds, not in the job's own
+  # python3: its Python 3.11+ on the runner, the same in an image with
+  # no python3 of its own, and a tool cache whose only Python fails
+  # when started, which leaves both files to the awk fallbacks. Each
+  # leg first proves which path the action took and fails if that is
+  # not the path it names.
   name-extraction:
     name: "Name Extraction [${{ matrix.mode.id }}]"
     runs-on: ubuntu-24.04
@@ -434,43 +438,138 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # One job per parser mode; each runs every fixture in turn
+        # One job per mode; each runs every fixture in turn. path is
+        # the parser path the action must take: parser (tomllib and
+        # ast) or fallback (the awk line matches).
         mode:
-          - id: "tomllib"
+          - id: "parser"
             image: ""
-          - id: "no-tomllib"
-            image: "python:3.10-slim@sha256:9d53d8d4c0e882f61913025db53b3aec4ef74336082a9ab47d8a14e9e8329b00"
-          - id: "no-python"
+            path: "parser"
+          - id: "parser-container"
             image: "ubuntu:24.04@sha256:008173c23f95b170204355c12626cb5a965d779a7e1283b09e9cffbb1bf33ca3"
+            path: "parser"
+          - id: "fallback"
+            image: ""
+            path: "fallback"
     steps:
-      - name: "Check parser mode: ${{ matrix.mode.id }}"
+      # Decoy python3 and python executables go first on PATH in every
+      # leg: the action must never start them. Each records that it
+      # ran and exits non-zero. The fallback leg points setup-python at
+      # a tool cache holding one Python (3.99.0, which satisfies
+      # >=3.11) that records that it ran and fails, so the parsers
+      # start it, see it fail and fall back. The probes are files the
+      # parsers and the fallbacks read differently: [project] "name"
+      # is a quoted key the awk match skips, so it returns the
+      # [tool.poetry] name, and it returns the first quoted name= in
+      # setup.py rather than the setup() keyword.
+      - name: "Prepare parser path: ${{ matrix.mode.id }}"
         shell: bash
         env:
-          MODE: ${{ matrix.mode.id }}
+          PARSER_PATH: ${{ matrix.mode.path }}
         run: |
-          # Fail unless the environment provides the mode under test, so
-          # an image change cannot silently skip a parser path
-          if command -v python3 > /dev/null 2>&1; then
-            python3 --version
-            if python3 -I -c 'import tomllib' 2> /dev/null; then
-              actual="tomllib"
-            else
-              actual="no-tomllib"
-            fi
-          else
-            actual="no-python"
+          # Prepare parser path
+          decoys="$RUNNER_TEMP/decoy-bin"
+          mkdir -p "$decoys"
+          for program in python3 python; do
+            cat > "$decoys/$program" <<'EOF'
+          #!/bin/sh
+          echo "$0" >> "$RUNNER_TEMP/decoy-ran"
+          exit 97
+          EOF
+            chmod +x "$decoys/$program"
+          done
+          echo "$decoys" >> "$GITHUB_PATH"
+          if [ "$PARSER_PATH" = "fallback" ]; then
+            toolcache="$RUNNER_TEMP/failing-toolcache"
+            install_dir="$toolcache/Python/3.99.0/x64"
+            mkdir -p "$install_dir/bin"
+            cat > "$install_dir/bin/python" <<'EOF'
+          #!/bin/sh
+          echo "$0" >> "$RUNNER_TEMP/provided-python-ran"
+          exit 1
+          EOF
+            chmod +x "$install_dir/bin/python"
+            touch "$install_dir.complete"
+            echo "AGENT_TOOLSDIRECTORY=$toolcache" >> "$GITHUB_ENV"
           fi
-          if [ "$actual" != "$MODE" ]; then
-            echo "Expected parser mode $MODE, found $actual ❌"
+          mkdir -p probe/pyproject probe/setup-py
+          cat > probe/pyproject/pyproject.toml <<'EOF'
+          [tool.poetry]
+          name = "awk-fallback"
+
+          [project]
+          "name" = "tomllib-parser"
+          EOF
+          cat > probe/setup-py/setup.py <<'EOF'
+          from setuptools import setup
+
+          fallback = dict(name="awk-fallback")
+          setup(name="ast-parser")
+          EOF
+
+      - name: "Run Action [probe: pyproject.toml]"
+        id: probe-pyproject
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "probe/pyproject/"
+
+      - name: "Run Action [probe: setup.py]"
+        id: probe-setup-py
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "probe/setup-py/"
+
+      - name: "Check parser path: ${{ matrix.mode.id }}"
+        shell: bash
+        env:
+          PARSER_PATH: ${{ matrix.mode.path }}
+          PYPROJECT_NAME: ${{ steps.probe-pyproject.outputs.python_project_name }}
+          SETUP_PY_NAME: ${{ steps.probe-setup-py.outputs.python_project_name }}
+        run: |
+          # Fail unless the action took the parser path this leg names
+          if [ "$PARSER_PATH" = "parser" ]; then
+            want_pyproject="tomllib-parser"
+            want_setup_py="ast-parser"
+          else
+            want_pyproject="awk-fallback"
+            want_setup_py="awk-fallback"
+          fi
+          ERROR=""
+          if [ "$PYPROJECT_NAME" != "$want_pyproject" ]; then
+            echo "pyproject.toml probe: expected $want_pyproject," \
+              "got '$PYPROJECT_NAME' ❌"
+            ERROR="true"
+          fi
+          if [ "$SETUP_PY_NAME" != "$want_setup_py" ]; then
+            echo "setup.py probe: expected $want_setup_py," \
+              "got '$SETUP_PY_NAME' ❌"
+            ERROR="true"
+          fi
+          if [ "$PARSER_PATH" = "fallback" ] &&
+            [ ! -s "$RUNNER_TEMP/provided-python-ran" ]; then
+            echo "The action did not start the interpreter setup-python" \
+              "provided ❌"
+            ERROR="true"
+          fi
+          if [ -e "$RUNNER_TEMP/decoy-ran" ]; then
+            echo "The action started a python3 or python from PATH ❌"
+            cat "$RUNNER_TEMP/decoy-ran"
+            ERROR="true"
+          fi
+          if [ "$ERROR" = "true" ]; then
             exit 1
           fi
-          echo "Parser mode: $actual ✅"
+          echo "Parser path: $PARSER_PATH ✅"
 
       # Each fixture lives in f/NN/ with its expectations alongside:
       # expect (the name, or empty when the action must fail),
       # file (the source it must come from) and case (its title).
-      # Fixtures listed in skip are not asserted in that mode; the
-      # import-blind awk fallback cannot resolve setup() imports.
+      # Fixtures whose skip lists a parser path are not asserted on
+      # it; the import-blind awk fallback cannot resolve setup()
+      # imports. Fixtures 65 and 66 are files the parsers reject, so
+      # the fallbacks must supply the name on every path.
       # <NUL> in a fixture becomes a raw NUL byte (GNU sed).
       - name: "Create fixtures"
         shell: bash
@@ -565,27 +664,27 @@ jobs:
 
           st.setup(name="my-project")
           EOF
-          fixture 14 'setup.py unrelated helper.setup call' setup.py 'my-project' 'no-python' <<'EOF'
+          fixture 14 'setup.py unrelated helper.setup call' setup.py 'my-project' 'fallback' <<'EOF'
           import helper
           import setuptools
 
           helper.setup(name="helper")
           setuptools.setup(name="my-project")
           EOF
-          fixture 15 'setup.py setup from another module' setup.py 'my-project' 'no-python' <<'EOF'
+          fixture 15 'setup.py setup from another module' setup.py 'my-project' 'fallback' <<'EOF'
           from mylib import setup
           from setuptools import setup as st_setup
 
           setup(name="helper")
           st_setup(name="my-project")
           EOF
-          fixture 16 'setup.py packaging setup shadowed by later import' setup.py '' 'no-python' <<'EOF'
+          fixture 16 'setup.py packaging setup shadowed by later import' setup.py '' 'fallback' <<'EOF'
           from setuptools import setup
           from mylib import setup
 
           setup(name="helper")
           EOF
-          fixture 17 'setup.py later packaging import shadows other setup' setup.py 'my-project' 'no-python' <<'EOF'
+          fixture 17 'setup.py later packaging import shadows other setup' setup.py 'my-project' 'fallback' <<'EOF'
           from mylib import setup
           from setuptools import setup
 
@@ -601,7 +700,7 @@ jobs:
 
           setup(name="foo<NUL>bar")
           EOF
-          fixture 20 'setup.py setup() in a function before the real call' setup.py 'my-project' 'no-python' <<'EOF'
+          fixture 20 'setup.py setup() in a function before the real call' setup.py 'my-project' 'fallback' <<'EOF'
           from setuptools import setup
 
 
@@ -611,7 +710,7 @@ jobs:
 
           setup(name="my-project")
           EOF
-          fixture 21 'setup.py function-local import' setup.py 'my-project' 'no-python' <<'EOF'
+          fixture 21 'setup.py function-local import' setup.py 'my-project' 'fallback' <<'EOF'
           from setuptools import setup
 
 
@@ -632,28 +731,28 @@ jobs:
           if __name__ == "__main__":
               main()
           EOF
-          fixture 23 'setup.py local def setup' setup.py '' 'no-python' <<'EOF'
+          fixture 23 'setup.py local def setup' setup.py '' 'fallback' <<'EOF'
           def setup(**kwargs):
               pass
 
 
           setup(name="helper")
           EOF
-          fixture 24 'setup.py star import from another module' setup.py '' 'no-python' <<'EOF'
+          fixture 24 'setup.py star import from another module' setup.py '' 'fallback' <<'EOF'
           from mylib import *
 
           setup(name="helper")
           EOF
-          fixture 25 'setup.py setup() with no import' setup.py '' 'no-python' <<'EOF'
+          fixture 25 'setup.py setup() with no import' setup.py '' 'fallback' <<'EOF'
           setup(name="helper")
           EOF
-          fixture 26 'setup.py packaging module root rebound' setup.py '' 'no-python' <<'EOF'
+          fixture 26 'setup.py packaging module root rebound' setup.py '' 'fallback' <<'EOF'
           import distutils.core
           import helper as distutils
 
           distutils.core.setup(name="helper")
           EOF
-          fixture 27 'setup.py import in an unrelated function' setup.py 'my-project' 'no-python' <<'EOF'
+          fixture 27 'setup.py import in an unrelated function' setup.py 'my-project' 'fallback' <<'EOF'
           from setuptools import setup
 
 
@@ -667,7 +766,7 @@ jobs:
 
           main()
           EOF
-          fixture 28 'setup.py class body import hidden from method' setup.py '' 'no-python' <<'EOF'
+          fixture 28 'setup.py class body import hidden from method' setup.py '' 'fallback' <<'EOF'
           class Builder:
               from setuptools import setup
 
@@ -683,7 +782,7 @@ jobs:
           setuptools.version = "1"
           setuptools.setup(name="my-project")
           EOF
-          fixture 30 'setup.py parameter shadows setup import' setup.py '' 'no-python' <<'EOF'
+          fixture 30 'setup.py parameter shadows setup import' setup.py '' 'fallback' <<'EOF'
           from setuptools import setup
 
 
@@ -693,26 +792,26 @@ jobs:
 
           main(print)
           EOF
-          fixture 31 'setup.py for loop rebinds setup' setup.py '' 'no-python' <<'EOF'
+          fixture 31 'setup.py for loop rebinds setup' setup.py '' 'fallback' <<'EOF'
           from setuptools import setup
 
           for setup in [print]:
               pass
           setup(name="helper")
           EOF
-          fixture 32 'setup.py comprehension variable does not leak' setup.py 'my-project' 'no-python' <<'EOF'
+          fixture 32 'setup.py comprehension variable does not leak' setup.py 'my-project' 'fallback' <<'EOF'
           from setuptools import setup
 
           names = [setup for setup in ["x"]]
           setup(name="my-project")
           EOF
-          fixture 33 'setup.py comprehension target shadows setup' setup.py 'my-project' 'no-python' <<'EOF'
+          fixture 33 'setup.py comprehension target shadows setup' setup.py 'my-project' 'fallback' <<'EOF'
           from setuptools import setup
 
           [setup(name="helper") for setup in [print]]
           setup(name="my-project")
           EOF
-          fixture 34 'setup.py match capture rebinds setup' setup.py '' 'no-python' <<'EOF'
+          fixture 34 'setup.py match capture rebinds setup' setup.py '' 'fallback' <<'EOF'
           from setuptools import setup
 
           match print:
@@ -720,21 +819,21 @@ jobs:
                   pass
           setup(name="helper")
           EOF
-          fixture 35 'setup.py setup() in a default value' setup.py 'my-project' 'no-python' <<'EOF'
+          fixture 35 'setup.py setup() in a default value' setup.py 'my-project' 'fallback' <<'EOF'
           from setuptools import setup
 
 
           def configure(value=setup(name="my-project")):
               return value
           EOF
-          fixture 36 'setup.py default runs before def rebinds setup' setup.py 'my-project' 'no-python' <<'EOF'
+          fixture 36 'setup.py default runs before def rebinds setup' setup.py 'my-project' 'fallback' <<'EOF'
           from setuptools import setup
 
 
           def setup(value=setup(name="my-project")):
               return value
           EOF
-          fixture 37 'setup.py walrus in a comprehension condition' setup.py '' 'no-python' <<'EOF'
+          fixture 37 'setup.py walrus in a comprehension condition' setup.py '' 'fallback' <<'EOF'
           from setuptools import setup
 
           [setup(name="helper") for _ in [0] if (setup := print)]
@@ -747,7 +846,7 @@ jobs:
           name = "my-project"
           version = "0.1.0"
           EOF
-          fixture 39 'setup.py setup() in a deferred annotation' setup.py 'my-project' 'no-python' <<'EOF'
+          fixture 39 'setup.py setup() in a deferred annotation' setup.py 'my-project' 'fallback' <<'EOF'
           from __future__ import annotations
 
           from setuptools import setup
@@ -759,7 +858,7 @@ jobs:
 
           setup(name="my-project")
           EOF
-          fixture 40 'setup.py with item binds before the next item' setup.py '' 'no-python' <<'EOF'
+          fixture 40 'setup.py with item binds before the next item' setup.py '' 'fallback' <<'EOF'
           from contextlib import nullcontext
 
           from setuptools import setup
@@ -771,19 +870,19 @@ jobs:
           [metadata]
           name = foo<NUL>bar
           EOF
-          fixture 42 'setup.py del setup' setup.py '' 'no-python' <<'EOF'
+          fixture 42 'setup.py del setup' setup.py '' 'fallback' <<'EOF'
           from setuptools import setup
 
           del setup
           setup(name="helper")
           EOF
-          fixture 43 'setup.py lambda walrus in a comprehension' setup.py 'my-project' 'no-python' <<'EOF'
+          fixture 43 'setup.py lambda walrus in a comprehension' setup.py 'my-project' 'fallback' <<'EOF'
           from setuptools import setup
 
           [(lambda: (setup := print)) for _ in [0]]
           setup(name="my-project")
           EOF
-          fixture 44 'setup.py call before a local assignment' setup.py '' 'no-python' <<'EOF'
+          fixture 44 'setup.py call before a local assignment' setup.py '' 'fallback' <<'EOF'
           from setuptools import setup
 
 
@@ -794,7 +893,7 @@ jobs:
 
           main()
           EOF
-          fixture 45 'setup.py local annotation without a value' setup.py '' 'no-python' <<'EOF'
+          fixture 45 'setup.py local annotation without a value' setup.py '' 'fallback' <<'EOF'
           from setuptools import setup
 
 
@@ -805,7 +904,7 @@ jobs:
 
           main()
           EOF
-          fixture 46 'setup.py packaging import in a dead branch' setup.py '' 'no-python' <<'EOF'
+          fixture 46 'setup.py packaging import in a dead branch' setup.py '' 'fallback' <<'EOF'
           def setup(**kwargs):
               pass
 
@@ -814,7 +913,7 @@ jobs:
               from setuptools import setup
           setup(name="helper")
           EOF
-          fixture 47 'setup.py try/except ImportError fallback' setup.py 'my-project' 'no-python' <<'EOF'
+          fixture 47 'setup.py try/except ImportError fallback' setup.py 'my-project' 'fallback' <<'EOF'
           try:
               from setuptools import setup
           except ImportError:
@@ -822,7 +921,7 @@ jobs:
 
           setup(name="my-project")
           EOF
-          fixture 48 'setup.py loop rebinds setup after the call' setup.py '' 'no-python' <<'EOF'
+          fixture 48 'setup.py loop rebinds setup after the call' setup.py '' 'fallback' <<'EOF'
           from setuptools import setup
 
           for attempt in [1, 2]:
@@ -830,14 +929,14 @@ jobs:
                   setup(name="helper")
               setup = print
           EOF
-          fixture 49 'setup.py dead call before the real call' setup.py 'my-project' 'no-python' <<'EOF'
+          fixture 49 'setup.py dead call before the real call' setup.py 'my-project' 'fallback' <<'EOF'
           from setuptools import setup
 
           if False:
               setup(name="helper")
           setup(name="my-project")
           EOF
-          fixture 50 'setup.py uncalled function before main' setup.py 'my-project' 'no-python' <<'EOF'
+          fixture 50 'setup.py uncalled function before main' setup.py 'my-project' 'fallback' <<'EOF'
           from setuptools import setup
 
 
@@ -851,7 +950,7 @@ jobs:
 
           main()
           EOF
-          fixture 51 'setup.py conditional del before the real call' setup.py 'my-project' 'no-python' <<'EOF'
+          fixture 51 'setup.py conditional del before the real call' setup.py 'my-project' 'fallback' <<'EOF'
           import os
 
           from setuptools import setup
@@ -860,7 +959,7 @@ jobs:
               del setup
           setup(name="my-project")
           EOF
-          fixture 52 'setup.py call after return in main' setup.py 'my-project' 'no-python' <<'EOF'
+          fixture 52 'setup.py call after return in main' setup.py 'my-project' 'fallback' <<'EOF'
           from setuptools import setup
 
 
@@ -876,13 +975,13 @@ jobs:
           main()
           build()
           EOF
-          fixture 53 'setup.py short-circuited call' setup.py 'my-project' 'no-python' <<'EOF'
+          fixture 53 'setup.py short-circuited call' setup.py 'my-project' 'fallback' <<'EOF'
           from setuptools import setup
 
           False and setup(name="wrong-name")
           setup(name="my-project")
           EOF
-          fixture 54 'setup.py class body runs before rebinding' setup.py 'my-project' 'no-python' <<'EOF'
+          fixture 54 'setup.py class body runs before rebinding' setup.py 'my-project' 'fallback' <<'EOF'
           from setuptools import setup
 
 
@@ -892,7 +991,7 @@ jobs:
 
           setup = print
           EOF
-          fixture 55 'setup.py recursion is not a call' setup.py 'my-project' 'no-python' <<'EOF'
+          fixture 55 'setup.py recursion is not a call' setup.py 'my-project' 'fallback' <<'EOF'
           from setuptools import setup
 
 
@@ -907,7 +1006,7 @@ jobs:
 
           main()
           EOF
-          fixture 56 'setup.py attribute call does not reach a def' setup.py 'my-project' 'no-python' <<'EOF'
+          fixture 56 'setup.py attribute call does not reach a def' setup.py 'my-project' 'fallback' <<'EOF'
           import os.path
 
           from setuptools import setup
@@ -924,7 +1023,7 @@ jobs:
           os.path.join("a", "b")
           main()
           EOF
-          fixture 57 'setup.py conditional call ranks below a certain one' setup.py 'my-project' 'no-python' <<'EOF'
+          fixture 57 'setup.py conditional call ranks below a certain one' setup.py 'my-project' 'fallback' <<'EOF'
           from setuptools import setup
 
 
@@ -940,7 +1039,7 @@ jobs:
               wrong()
           main()
           EOF
-          fixture 58 'setup.py generator call does not run its body' setup.py 'my-project' 'no-python' <<'EOF'
+          fixture 58 'setup.py generator call does not run its body' setup.py 'my-project' 'fallback' <<'EOF'
           from setuptools import setup
 
 
@@ -956,7 +1055,7 @@ jobs:
           wrong()
           main()
           EOF
-          fixture 59 'setup.py nested class skips the outer class scope' setup.py 'my-project' 'no-python' <<'EOF'
+          fixture 59 'setup.py nested class skips the outer class scope' setup.py 'my-project' 'fallback' <<'EOF'
           from setuptools import setup
 
 
@@ -966,7 +1065,7 @@ jobs:
               class Inner:
                   setup(name="my-project")
           EOF
-          fixture 60 'setup.py call after a possible return' setup.py 'my-project' 'no-python' <<'EOF'
+          fixture 60 'setup.py call after a possible return' setup.py 'my-project' 'fallback' <<'EOF'
           from setuptools import setup
 
 
@@ -987,7 +1086,7 @@ jobs:
           maybe()
           main()
           EOF
-          fixture 61 'setup.py ambiguous alias call is not certain' setup.py 'my-project' 'no-python' <<'EOF'
+          fixture 61 'setup.py ambiguous alias call is not certain' setup.py 'my-project' 'fallback' <<'EOF'
           import os
 
           from setuptools import setup
@@ -1008,7 +1107,7 @@ jobs:
           f()
           main()
           EOF
-          fixture 62 'setup.py nested loop break falls through' setup.py 'my-project' 'no-python' <<'EOF'
+          fixture 62 'setup.py nested loop break falls through' setup.py 'my-project' 'fallback' <<'EOF'
           from setuptools import setup
 
 
@@ -1031,7 +1130,7 @@ jobs:
               wrong()
           hop()
           EOF
-          fixture 63 'setup.py loop else after a break' setup.py 'my-project' 'no-python' <<'EOF'
+          fixture 63 'setup.py loop else after a break' setup.py 'my-project' 'fallback' <<'EOF'
           from setuptools import setup
 
 
@@ -1049,7 +1148,7 @@ jobs:
               wrong()
           main()
           EOF
-          fixture 64 'setup.py try else after a caught raise' setup.py 'my-project' 'no-python' <<'EOF'
+          fixture 64 'setup.py try else after a caught raise' setup.py 'my-project' 'fallback' <<'EOF'
           from setuptools import setup
 
 
@@ -1068,6 +1167,19 @@ jobs:
           else:
               wrong()
           main()
+          EOF
+          fixture 65 'pyproject malformed TOML' pyproject.toml 'my-project' '' <<'EOF'
+          [project]
+          name = "my-project"
+          version = "0.1.0"
+          dependencies = [
+          EOF
+          fixture 66 'setup.py Python 2 syntax' setup.py 'my-project' '' <<'EOF'
+          from setuptools import setup
+
+          print "Building my-project"
+
+          setup(name="my-project")
           EOF
 
       # Invalid names must fail the action, so failures do not stop
@@ -1526,6 +1638,20 @@ jobs:
         with:
           path_prefix: "f/64/"
 
+      - name: "Run Action [65: pyproject malformed TOML]"
+        id: f65
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/65/"
+
+      - name: "Run Action [66: setup.py Python 2 syntax]"
+        id: f66
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: "f/66/"
+
       - name: "Validate Action Output"
         shell: bash
         # One line per fixture: outcome|name|package|source|project_file
@@ -1595,7 +1721,9 @@ jobs:
           RESULT_62: "${{ steps.f62.outcome }}|${{ steps.f62.outputs.python_project_name }}|${{ steps.f62.outputs.python_package_name }}|${{ steps.f62.outputs.source }}|${{ steps.f62.outputs.python_project_file }}"
           RESULT_63: "${{ steps.f63.outcome }}|${{ steps.f63.outputs.python_project_name }}|${{ steps.f63.outputs.python_package_name }}|${{ steps.f63.outputs.source }}|${{ steps.f63.outputs.python_project_file }}"
           RESULT_64: "${{ steps.f64.outcome }}|${{ steps.f64.outputs.python_project_name }}|${{ steps.f64.outputs.python_package_name }}|${{ steps.f64.outputs.source }}|${{ steps.f64.outputs.python_project_file }}"
-          MODE: ${{ matrix.mode.id }}
+          RESULT_65: "${{ steps.f65.outcome }}|${{ steps.f65.outputs.python_project_name }}|${{ steps.f65.outputs.python_package_name }}|${{ steps.f65.outputs.source }}|${{ steps.f65.outputs.python_project_file }}"
+          RESULT_66: "${{ steps.f66.outcome }}|${{ steps.f66.outputs.python_project_name }}|${{ steps.f66.outputs.python_package_name }}|${{ steps.f66.outputs.source }}|${{ steps.f66.outputs.python_project_file }}"
+          PARSER_PATH: ${{ matrix.mode.path }}
         # yamllint enable rule:line-length
         run: |
           # Validate every fixture, reporting all failures before exiting
@@ -1605,8 +1733,8 @@ jobs:
             case_name=$(cat "$dir/case")
             expect=$(cat "$dir/expect")
             source=$(cat "$dir/file")
-            if [[ " $(cat "$dir/skip") " == *" $MODE "* ]]; then
-              echo "⏭️  $nn $case_name: not asserted in $MODE mode"
+            if [[ " $(cat "$dir/skip") " == *" $PARSER_PATH "* ]]; then
+              echo "⏭️  $nn $case_name: not asserted on the $PARSER_PATH path"
               continue
             fi
             var="RESULT_$nn"
@@ -1640,8 +1768,13 @@ jobs:
               failures=$((failures + 1))
             fi
           done
+          if [ -e "$RUNNER_TEMP/decoy-ran" ]; then
+            echo "❌ The action started a python3 or python from PATH:"
+            cat "$RUNNER_TEMP/decoy-ran"
+            failures=$((failures + 1))
+          fi
           if [ "$failures" -ne 0 ]; then
-            echo "$failures fixture(s) failed ❌"
+            echo "$failures check(s) failed ❌"
             exit 1
           fi
           echo "All fixtures passed ✅"
