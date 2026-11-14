@@ -418,6 +418,115 @@ jobs:
             exit 1
           fi
 
+  ### The parsers must start the interpreter setup-python provides ###
+  # Plant python3 and python executables first on the caller's PATH;
+  # each records that it ran and exits non-zero. The action must still
+  # return the names its parsers read, start neither, and leave PATH
+  # as it found it. The fixtures are ones the awk fallbacks read
+  # differently, so a parser started from PATH that failed would also
+  # change the names returned.
+  interpreter-selection:
+    name: "Interpreter Selection"
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    timeout-minutes: 5
+    steps:
+      - name: "Plant python3 and python first on PATH"
+        shell: bash
+        run: |
+          # Plant python3 and python first on PATH, and fixtures
+          planted="$RUNNER_TEMP/planted-bin"
+          mkdir -p "$planted"
+          for program in python3 python; do
+            cat > "$planted/$program" <<'EOF'
+          #!/bin/sh
+          echo "$0" >> "$RUNNER_TEMP/planted-python-ran"
+          exit 97
+          EOF
+            chmod +x "$planted/$program"
+          done
+          echo "$planted" >> "$GITHUB_PATH"
+          mkdir -p selection-pyproject selection-setup-py
+          cat > selection-pyproject/pyproject.toml <<'EOF'
+          [tool.poetry]
+          name = "awk-fallback"
+
+          [project]
+          "name" = "tomllib-parser"
+          EOF
+          cat > selection-setup-py/setup.py <<'EOF'
+          from setuptools import setup
+
+          fallback = dict(name="awk-fallback")
+          setup(name="ast-parser")
+          EOF
+
+      - name: "Record PATH before the action"
+        shell: bash
+        run: |
+          # Record PATH, once the planted executables lead it
+          for program in python3 python; do
+            found=$(command -v "$program" || true)
+            if [ "$found" != "$RUNNER_TEMP/planted-bin/$program" ]; then
+              echo "PATH finds $program at $found, not the planted one ❌"
+              exit 1
+            fi
+          done
+          printf '%s\n' "$PATH" > "$RUNNER_TEMP/path-before"
+          echo "PATH before the action: $PATH"
+
+      - name: "Run Action [pyproject.toml with python3 planted on PATH]"
+        id: pyproject
+        uses: $/
+        with:
+          path_prefix: "selection-pyproject/"
+
+      - name: "Run Action [setup.py with python3 planted on PATH]"
+        id: setup-py
+        uses: $/
+        with:
+          path_prefix: "selection-setup-py/"
+
+      - name: "Validate Action Output: interpreter selection"
+        shell: bash
+        env:
+          PYPROJECT_NAME: ${{ steps.pyproject.outputs.python_project_name }}
+          PYPROJECT_SOURCE: ${{ steps.pyproject.outputs.source }}
+          SETUP_PY_NAME: ${{ steps.setup-py.outputs.python_project_name }}
+          SETUP_PY_SOURCE: ${{ steps.setup-py.outputs.source }}
+        run: |
+          # Validate that the parsers ran without the planted executables
+          ERROR=""
+          if [ "$PYPROJECT_NAME" != "tomllib-parser" ] ||
+            [ "$PYPROJECT_SOURCE" != "pyproject.toml" ]; then
+            echo "Unexpected pyproject.toml result:" \
+              "$PYPROJECT_NAME ($PYPROJECT_SOURCE) ❌"
+            ERROR="true"
+          fi
+          if [ "$SETUP_PY_NAME" != "ast-parser" ] ||
+            [ "$SETUP_PY_SOURCE" != "setup.py" ]; then
+            echo "Unexpected setup.py result:" \
+              "$SETUP_PY_NAME ($SETUP_PY_SOURCE) ❌"
+            ERROR="true"
+          fi
+          if [ -e "$RUNNER_TEMP/planted-python-ran" ]; then
+            echo "The action started a planted executable:"
+            cat "$RUNNER_TEMP/planted-python-ran"
+            ERROR="true"
+          fi
+          if [ "$PATH" != "$(cat "$RUNNER_TEMP/path-before")" ]; then
+            echo "PATH changed across the action ❌"
+            echo "Before: $(cat "$RUNNER_TEMP/path-before")"
+            echo "After:  $PATH"
+            ERROR="true"
+          fi
+          if [ "$ERROR" != "true" ]; then
+            echo "The parsers started the provided interpreter ✅"
+          else
+            exit 1
+          fi
+
   ### Name extraction: quoting, spacing, scoping and parser paths ###
   # Every fixture runs on each parser path. The parsers start the
   # interpreter setup-python provides, never the caller's python3, so
