@@ -141,11 +141,8 @@ runs:
           "$PYTHON" -I - "$toml" "$pep508" <<'PY'
         import re
         import sys
+        import tomllib
 
-        try:
-            import tomllib
-        except ImportError:
-            sys.exit(3)
         try:
             with open(sys.argv[1], "rb") as toml_file:
                 data = tomllib.load(toml_file)
@@ -386,8 +383,6 @@ runs:
         import re
         import sys
 
-        if sys.version_info < (3, 8):
-            sys.exit(3)
         try:
             with open(sys.argv[1], "rb") as setup_file:
                 tree = ast.parse(setup_file.read(), sys.argv[1])
@@ -663,12 +658,8 @@ runs:
             ast.DictComp,
             ast.GeneratorExp,
         )
-        # Pattern captures in a match statement (Python 3.10+ only)
-        MATCH_CAPTURES = tuple(
-            getattr(ast, kind)
-            for kind in ("MatchAs", "MatchStar", "MatchMapping")
-            if hasattr(ast, kind)
-        )
+        # Pattern captures in a match statement
+        MATCH_CAPTURES = (ast.MatchAs, ast.MatchStar, ast.MatchMapping)
         # Statements and expressions that bind names in their own scope;
         # a comprehension's loop variables are bound in its own scope
         NAME_BINDERS = (
@@ -849,14 +840,8 @@ runs:
             return merged
 
 
-        def ast_types(*names):
-            # The named AST node types this Python version has
-            return tuple(getattr(ast, n) for n in names if hasattr(ast, n))
-
-
-        # Compound statements that only some Python versions have
-        TRY_STATEMENTS = ast_types("Try", "TryStar")
-        MATCH_STATEMENTS = ast_types("Match")
+        TRY_STATEMENTS = (ast.Try, ast.TryStar)
+        MATCH_STATEMENTS = (ast.Match,)
         # Enough passes for a loop's bindings to settle: each pass can only
         # add kinds to a name, and there are few kinds
         LOOP_LIMIT = 8
