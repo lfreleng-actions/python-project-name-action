@@ -89,7 +89,7 @@ runs:
 
     # Check for pyproject.toml first (preferred)
     # yamllint disable-line rule:line-length
-    - uses: lfreleng-actions/path-check-action@fb77045699ead7bb7014186ae23e4935ce277a21 # v0.2.3
+    - uses: lfreleng-actions/path-check-action@a873d0e6fc875fe54b36d38cd2a01c8cd9fe0c0b # v0.2.4
       id: pyproject-toml
       with:
         path: "${{ steps.setup.outputs.path_prefix }}/pyproject.toml"
@@ -239,7 +239,7 @@ runs:
     # This runs whenever pyproject.toml did not yield a project name,
     # whether the file is absent or carries only a [build-system] table.
     # yamllint disable-line rule:line-length
-    - uses: lfreleng-actions/path-check-action@fb77045699ead7bb7014186ae23e4935ce277a21 # v0.2.3
+    - uses: lfreleng-actions/path-check-action@a873d0e6fc875fe54b36d38cd2a01c8cd9fe0c0b # v0.2.4
       id: setup-cfg
       if: steps.pyproject-name.outputs.extracted_string == ''
       with:
@@ -337,7 +337,7 @@ runs:
     # Fall back to setup.py if neither pyproject.toml nor setup.cfg
     # yielded a usable project name
     # yamllint disable-line rule:line-length
-    - uses: lfreleng-actions/path-check-action@fb77045699ead7bb7014186ae23e4935ce277a21 # v0.2.3
+    - uses: lfreleng-actions/path-check-action@a873d0e6fc875fe54b36d38cd2a01c8cd9fe0c0b # v0.2.4
       id: setup-py
       if: >-
         steps.pyproject-name.outputs.extracted_string == '' &&
